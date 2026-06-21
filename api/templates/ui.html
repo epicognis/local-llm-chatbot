@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Chatbot</title>
+  <link rel="stylesheet" href="/static/chat.css" />
+</head>
+<body>
+
+<!-- ── Left sidebar ── -->
+<button id="sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle sidebar">☰</button>
+<div id="sidebar-backdrop" onclick="toggleSidebar()"></div>
+<div id="sidebar">
+  <h3>Model</h3>
+  <select id="model-picker"></select>
+
+  <button id="new-session-btn" onclick="newSession()">+ New Session</button>
+
+  <h3>Sessions</h3>
+  <div id="session-list"></div>
+</div>
+
+<!-- ── Main chat pane ── -->
+<div id="main">
+  <div id="transcript"></div>
+
+  <div id="input-area">
+    <textarea id="msg-input" rows="3"
+      placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+    <button id="send-btn" onclick="sendMessage()">Send</button>
+  </div>
+</div>
+
+<script>
+  const DEFAULT_MODEL = {{ default_model | tojson }};
+
+  let currentSessionId = null;
+  let isStreaming = false;
+
+  // ── Bootstrap ──────────────────────────────────────────
+
+  async function init() {
+    await loadModels();
+    await loadSessions();
+    newSession({ collapse: false });
+    collapseSidebar(); // start collapsed on phones so the input isn't hidden under the overlay
+    document.getElementById('model-picker').addEventListener('change', collapseSidebar);
+  }
+
+  // ── Sidebar collapse (mobile) ──────────────────────────
+
+  function isMobile() {
+    return window.matchMedia('(max-width: 700px)').matches;
+  }
+
+  function collapseSidebar() {
+    if (isMobile()) document.body.classList.add('sidebar-collapsed');
+  }
+
+  function toggleSidebar() {
+    document.body.classList.toggle('sidebar-collapsed');
+  }
+
+  async function loadModels() {
+    const res = await fetch('/models');
+    const models = await res.json();
+    const picker = document.getElementById('model-picker');
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      opt.textContent = m.name;
+      if (m.name === DEFAULT_MODEL) opt.selected = true;
+      picker.appendChild(opt);
+    });
+  }
+
+  async function loadSessions() {
+    const res = await fetch('/sessions');
+    const sessions = await res.json();
+    const list = document.getElementById('session-list');
+    list.innerHTML = '';
+    sessions.forEach(({ session_id: sid, name }) => {
+      const div = document.createElement('div');
+      div.className = 'session-item' + (sid === currentSessionId ? ' active' : '');
+      div.title = sid;
+
+      const label = document.createElement('span');
+      label.className = 'session-label';
+      label.textContent = name || (sid.slice(0, 8) + '…');
+      label.onclick = () => openSession(sid);
+      div.appendChild(label);
+
+      const renameBtn = document.createElement('button');
+      renameBtn.className = 'session-action';
+      renameBtn.textContent = '✎';
+      renameBtn.title = 'Rename session';
+      renameBtn.onclick = (e) => { e.stopPropagation(); renameSession(sid, name); };
+      div.appendChild(renameBtn);
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'session-action';
+      deleteBtn.textContent = '🗑';
+      deleteBtn.title = 'Delete session';
+      deleteBtn.onclick = (e) => { e.stopPropagation(); deleteSession(sid); };
+      div.appendChild(deleteBtn);
+
+      list.appendChild(div);
+    });
+  }
+
+  async function renameSession(sid, currentName) {
+    const name = prompt('Session name:', currentName || '');
+    if (name === null) return;
+    await fetch(`/sessions/${sid}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    loadSessions();
+  }
+
+  async function deleteSession(sid) {
+    if (!confirm('Delete this session? This cannot be undone.')) return;
+    await fetch(`/sessions/${sid}`, { method: 'DELETE' });
+    if (sid === currentSessionId) newSession({ collapse: false });
+    else loadSessions();
+  }
+
+  // ── Session management ─────────────────────────────────
+
+  function newSession({ collapse = true } = {}) {
+    currentSessionId = crypto.randomUUID();
+    document.getElementById('transcript').innerHTML = '';
+    loadSessions();
+    if (collapse) collapseSidebar();
+  }
+
+  async function openSession(sid) {
+    currentSessionId = sid;
+    const res = await fetch(`/sessions/${sid}/turns`);
+    const turns = await res.json();
+    const transcript = document.getElementById('transcript');
+    transcript.innerHTML = '';
+    turns.forEach(t => appendMessage(t.role, t.content));
+    highlightActive();
+    collapseSidebar();
+  }
+
+  function highlightActive() {
+    document.querySelectorAll('.session-item').forEach(el => {
+      el.classList.toggle('active', el.title === currentSessionId);
+    });
+  }
+
+  // ── Transcript helpers ─────────────────────────────────
+
+  function appendMessage(role, content) {
+    const transcript = document.getElementById('transcript');
+    const wrap = document.createElement('div');
+    wrap.className = `message ${role}`;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = content;
+    wrap.appendChild(bubble);
+    transcript.appendChild(wrap);
+    transcript.scrollTop = transcript.scrollHeight;
+    return bubble;
+  }
+
+  // ── Send & stream ──────────────────────────────────────
+
+  async function sendMessage() {
+    if (isStreaming) return;
+    const input = document.getElementById('msg-input');
+    const message = input.value.trim();
+    if (!message) return;
+    if (!currentSessionId) currentSessionId = crypto.randomUUID();
+
+    input.value = '';
+    appendMessage('user', message);
+
+    const model = document.getElementById('model-picker').value;
+    const aiBubble = appendMessage('assistant', '');
+    aiBubble.classList.add('streaming');
+
+    isStreaming = true;
+    document.getElementById('send-btn').disabled = true;
+
+    try {
+      const response = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: currentSessionId, message, model }),
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6);
+          if (raw === '[DONE]') break;
+          try {
+            const token = JSON.parse(raw);
+            aiBubble.textContent += token;
+            aiBubble.parentElement.parentElement.scrollTop =
+              aiBubble.parentElement.parentElement.scrollHeight;
+          } catch (_) { /* skip malformed chunk */ }
+        }
+      }
+    } catch (err) {
+      aiBubble.textContent += '\n[Connection error: ' + err.message + ']';
+    } finally {
+      aiBubble.classList.remove('streaming');
+      isStreaming = false;
+      document.getElementById('send-btn').disabled = false;
+      loadSessions(); // refresh list (new session appears)
+    }
+  }
+
+  document.getElementById('msg-input').addEventListener('focus', collapseSidebar);
+
+  document.getElementById('msg-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  init();
+</script>
+</body>
+</html>
