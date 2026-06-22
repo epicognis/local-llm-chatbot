@@ -1,8 +1,8 @@
 MODEL_REGISTRY: list[dict] = [
+    {"name": "Gemma 4 12B", "model": "gemma4:12b",  "default_ctx": 65536},
     {"name": "GPT-OSS 20B", "model": "gpt-oss:20b", "default_ctx": 131072},
     {"name": "Qwen3 14B",   "model": "qwen3:14b",   "default_ctx": 40960},
     {"name": "Qwen3 8B",    "model": "qwen3:8b",    "default_ctx": 16384},
-    {"name": "Gemma 4 12B", "model": "gemma4:12b",  "default_ctx": 32768},
     {"name": "Llama 3.1 8B","model": "llama3.1:8b", "default_ctx": 8192},
 ]
 

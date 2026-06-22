@@ -1,21 +1,54 @@
 #!/usr/bin/env bash
-# Standalone GPU/host/model monitor — runs independently of the chat server.
-# Safe to start/stop any time; it just reads nvidia-smi, psutil, Ollama's
-# /api/ps, and (for tok/s) the server's log file, if present.
+#
+# run_monitor.sh — provision an isolated venv, resolve dependencies, and launch
+# the realtime LLM + hardware monitor. Completely standalone: it gets its own
+# venv (separate from the server's .venv) so installing into it can never
+# trigger the server's --reload file watcher again. Re-running is cheap — the
+# venv is reused and deps only reinstall when requirements.txt changes.
+#
+#   ./run_monitor.sh                         # live dashboard (1s)
+#   ./run_monitor.sh -i 0.5                  # faster sampling
+#   ./run_monitor.sh --once                  # single snapshot, then exit
+#   ./run_monitor.sh --no-tui                # plain scrolling output
+#   ./run_monitor.sh --csv run.csv           # also log every sample to CSV
+#   OLLAMA_BASE_URL=http://localhost:11434 ./run_monitor.sh
+#   PYTHON=python3.11 ./run_monitor.sh       # pin the interpreter
+#
+# Any arguments are passed straight through to monitor/monitor.py (see --help).
+#
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
 
-VENV_DIR=".venv"
-PYTHON_BIN="$VENV_DIR/Scripts/python.exe"
-[ -f "$PYTHON_BIN" ] || PYTHON_BIN="$VENV_DIR/bin/python"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/monitor" && pwd)"
+cd "$HERE"
 
-if [ ! -f "$PYTHON_BIN" ]; then
-    echo "Creating virtualenv in $VENV_DIR ..."
-    python -m venv "$VENV_DIR"
-    PYTHON_BIN="$VENV_DIR/Scripts/python.exe"
-    [ -f "$PYTHON_BIN" ] || PYTHON_BIN="$VENV_DIR/bin/python"
+VENV="$HERE/.venv"
+PY="${PYTHON:-python}"
+command -v "$PY" >/dev/null 2>&1 || PY="python3"
+
+FRESH=0
+if [ ! -d "$VENV" ]; then
+  echo "[run_monitor] creating venv at monitor/.venv ..."
+  "$PY" -m venv "$VENV"
+  FRESH=1
 fi
 
-"$PYTHON_BIN" -m pip install -q -r monitor/requirements.txt
+# Activate — Windows (Git Bash) uses Scripts/, POSIX uses bin/.
+if [ -f "$VENV/Scripts/activate" ]; then
+  # shellcheck disable=SC1091
+  source "$VENV/Scripts/activate"
+else
+  # shellcheck disable=SC1091
+  source "$VENV/bin/activate"
+fi
 
-exec "$PYTHON_BIN" monitor/monitor_app.py
+# Install deps on first run, or whenever requirements.txt is newer than the marker.
+MARKER="$VENV/.requirements.installed"
+if [ "$FRESH" = "1" ] || [ requirements.txt -nt "$MARKER" ]; then
+  echo "[run_monitor] installing requirements ..."
+  python -m pip install --quiet --upgrade pip
+  python -m pip install --quiet -r requirements.txt
+  touch "$MARKER"
+fi
+
+echo "[run_monitor] OLLAMA_BASE_URL = ${OLLAMA_BASE_URL:-http://localhost:11434}"
+exec python monitor.py "$@"

@@ -15,9 +15,12 @@ class OllamaBackend(LLMBackend):
 
     async def _stream_from_ollama(self, messages: list[dict], model: str, **opts):
         think = opts.pop("think", None)
+        keep_alive = opts.pop("keep_alive", None)
         payload = {"model": model, "messages": messages, "stream": True}
         if think is not None:
             payload["think"] = think
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
         if opts:
             payload["options"] = opts
 
@@ -66,12 +69,20 @@ class OllamaBackend(LLMBackend):
         # than silently returning nothing.
         if not content_emitted and thinking_buffer:
             yield "".join(thinking_buffer)
+        elif not content_emitted:
+            # Ollama can return a clean "done" stream with zero output if the
+            # model failed to finish loading in time (e.g. a large num_ctx cold
+            # load timing out) — surface that instead of leaving the UI blank.
+            yield "[No response from the model — it may still be loading (large context windows can take a while to warm up). Please try again.]"
 
     async def _chat_complete(self, messages: list[dict], model: str, **opts) -> str:
         think = opts.pop("think", None)
+        keep_alive = opts.pop("keep_alive", None)
         payload = {"model": model, "messages": messages, "stream": False}
         if think is not None:
             payload["think"] = think
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
         if opts:
             payload["options"] = opts
 
@@ -81,6 +92,17 @@ class OllamaBackend(LLMBackend):
             data = response.json()
             msg = data["message"]
             return msg.get("content") or msg.get("thinking", "")
+
+    async def is_loaded(self, model: str) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                resp = await client.get(f"{self.base_url}/api/ps")
+            if resp.status_code != 200:
+                return True  # don't block chat on a health-check hiccup
+            data = resp.json()
+            return any(m.get("name") == model for m in data.get("models", []))
+        except Exception:
+            return True
 
     async def summarize(self, text: str, model: str) -> str:
         messages = [

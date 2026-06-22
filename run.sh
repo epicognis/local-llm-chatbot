@@ -18,4 +18,7 @@ fi
 
 "$PYTHON_BIN" -m pip install -q -r requirements.txt
 
-"$PYTHON_BIN" -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload 2>&1 | tee server.log
+"$PYTHON_BIN" -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload \
+    --reload-dir api --reload-dir config --reload-dir llm \
+    --reload-dir metrics --reload-dir orchestrator --reload-dir session \
+    2>&1 | tee server.log

@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     DEFAULT_MODEL: str = "Gemma 4 12B"
 
     OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_KEEP_ALIVE: str = "30m"
 
     DEFAULT_TEMPERATURE: float = 0.7
     DEFAULT_MAX_TOKENS: int = 1024

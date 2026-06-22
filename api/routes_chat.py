@@ -19,7 +19,7 @@ async def chat(body: ChatRequest, request: Request):
 
     async def event_stream():
         try:
-            async for token in orchestrator.chat_stream(
+            async for event in orchestrator.chat_stream(
                 session_id=body.session_id,
                 message=body.message,
                 model_name=body.model,
@@ -28,9 +28,9 @@ async def chat(body: ChatRequest, request: Request):
             ):
                 if await request.is_disconnected():
                     break
-                yield f"data: {json.dumps(token)}\n\n"
+                yield f"data: {json.dumps(event)}\n\n"
         except Exception as exc:
-            yield f"data: {json.dumps('[ERROR] ' + str(exc))}\n\n"
+            yield f"data: {json.dumps({'type': 'token', 'text': '[ERROR] ' + str(exc)})}\n\n"
         finally:
             yield "data: [DONE]\n\n"
 

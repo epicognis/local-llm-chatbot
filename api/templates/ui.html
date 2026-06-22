@@ -38,6 +38,19 @@
   let currentSessionId = null;
   let isStreaming = false;
 
+  // crypto.randomUUID() only exists in secure contexts (HTTPS or localhost);
+  // this app is served over plain HTTP on the LAN for phone access, so fall
+  // back to a manual UUID v4 when it's unavailable.
+  function newUUID() {
+    if (window.crypto && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+  }
+
   // ── Bootstrap ──────────────────────────────────────────
 
   async function init() {
@@ -69,7 +82,7 @@
     models.forEach(m => {
       const opt = document.createElement('option');
       opt.value = m.name;
-      opt.textContent = m.name;
+      opt.textContent = `${m.name} (ctx-${m.default_ctx})`;
       if (m.name === DEFAULT_MODEL) opt.selected = true;
       picker.appendChild(opt);
     });
@@ -130,7 +143,7 @@
   // ── Session management ─────────────────────────────────
 
   function newSession({ collapse = true } = {}) {
-    currentSessionId = crypto.randomUUID();
+    currentSessionId = newUUID();
     document.getElementById('transcript').innerHTML = '';
     loadSessions();
     if (collapse) collapseSidebar();
@@ -175,7 +188,7 @@
     const input = document.getElementById('msg-input');
     const message = input.value.trim();
     if (!message) return;
-    if (!currentSessionId) currentSessionId = crypto.randomUUID();
+    if (!currentSessionId) currentSessionId = newUUID();
 
     input.value = '';
     appendMessage('user', message);
@@ -187,11 +200,24 @@
     isStreaming = true;
     document.getElementById('send-btn').disabled = true;
 
+    // Watchdog: if the server goes completely silent (hung/zombie process,
+    // dropped connection) for this long, give up instead of leaving the UI
+    // stuck disabled forever. Reset on every chunk, so long-but-active
+    // streams (slow models, cold loads) are never cut off.
+    const controller = new AbortController();
+    let watchdog;
+    const resetWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => controller.abort(), 120000);
+    };
+    resetWatchdog();
+
     try {
       const response = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: currentSessionId, message, model }),
+        signal: controller.signal,
       });
 
       const reader = response.body.getReader();
@@ -200,6 +226,7 @@
 
       while (true) {
         const { done, value } = await reader.read();
+        resetWatchdog();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -209,16 +236,29 @@
           const raw = line.slice(6);
           if (raw === '[DONE]') break;
           try {
-            const token = JSON.parse(raw);
-            aiBubble.textContent += token;
+            const event = JSON.parse(raw);
+            if (event.type === 'status') {
+              aiBubble.textContent = '⏳ ' + event.text;
+              aiBubble.classList.add('status');
+            } else {
+              if (aiBubble.classList.contains('status')) {
+                aiBubble.textContent = '';
+                aiBubble.classList.remove('status');
+              }
+              aiBubble.textContent += event.text;
+            }
             aiBubble.parentElement.parentElement.scrollTop =
               aiBubble.parentElement.parentElement.scrollHeight;
           } catch (_) { /* skip malformed chunk */ }
         }
       }
     } catch (err) {
-      aiBubble.textContent += '\n[Connection error: ' + err.message + ']';
+      const reason = err.name === 'AbortError'
+        ? 'No response from the server for 2 minutes — giving up. The server may be stuck; try again.'
+        : err.message;
+      aiBubble.textContent += '\n[Connection error: ' + reason + ']';
     } finally {
+      clearTimeout(watchdog);
       aiBubble.classList.remove('streaming');
       isStreaming = false;
       document.getElementById('send-btn').disabled = false;

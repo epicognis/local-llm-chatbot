@@ -97,13 +97,22 @@ class Orchestrator:
             "num_predict": resolved_max_tokens,
             "num_ctx": default_ctx,
             "think": False,
+            "keep_alive": settings.OLLAMA_KEEP_ALIVE,
         }
+
+        if not await self.backend.is_loaded(model):
+            log.info("model_cold_start", session_id=session_id, model=model, num_ctx=default_ctx)
+            yield {
+                "type": "status",
+                "text": f"Loading {model_name} into memory (ctx={default_ctx}) — "
+                        f"large context windows can take up to a minute on first use…",
+            }
 
         try:
             async for token in self.backend.chat(messages, model, stream=True, **opts):
                 response_parts.append(token)
                 metrics.count_token()
-                yield token
+                yield {"type": "token", "text": token}
         finally:
             full_response = "".join(response_parts)
             if full_response:

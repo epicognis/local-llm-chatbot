@@ -23,3 +23,7 @@ class LLMBackend(ABC):
     @abstractmethod
     async def summarize(self, text: str, model: str) -> str:
         """Condense older conversation turns into a compact summary."""
+
+    async def is_loaded(self, model: str) -> bool:
+        """Whether the model is already warm. Backends without this concept report True."""
+        return True
