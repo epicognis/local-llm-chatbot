@@ -1,7 +1,7 @@
-import httpx
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+
 from config.settings import settings
 
 router = APIRouter()
@@ -9,17 +9,21 @@ router = APIRouter()
 
 @router.get("/health")
 async def health(request: Request):
-    loaded_models = []
-    try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{settings.OLLAMA_BASE_URL}/api/ps")
-            if resp.status_code == 200:
-                data = resp.json()
-                loaded_models = [m["name"] for m in data.get("models", [])]
-    except Exception:
-        pass
+    """Liveness. Always 200 while the server is up; Ollama status is informational."""
+    result = {"status": "ok", "backend": settings.LLM_BACKEND, "loaded_models": []}
+    loaded = getattr(request.app.state.backend, "loaded_models", None)
+    if loaded is not None:
+        try:
+            result["loaded_models"] = await loaded()
+            result["ollama"] = "reachable"
+        except Exception:
+            result["ollama"] = "unreachable"
+    return result
 
-    return {"status": "ok", "backend": settings.LLM_BACKEND, "loaded_models": loaded_models}
+
+@router.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse("/ui")
 
 
 @router.get("/ui", response_class=HTMLResponse)

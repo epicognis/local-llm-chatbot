@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+
 from llm.backends.base import LLMBackend
 from orchestrator.context_budget import estimate_tokens
 from session.store import SessionStore, Turn
@@ -7,6 +8,11 @@ from session.store import SessionStore, Turn
 class ContextProvider(ABC):
     """Prepares the (turns, summary) pair the allocator packs each turn.
     Each progressive level (§7 of the build spec) is just a different provider."""
+
+    def pending_work(self, session: dict, turns: list[Turn]) -> str | None:
+        """A user-facing status line if prepare() is about to do slow work
+        (e.g. a summarize() call), so the UI isn't left silent. None otherwise."""
+        return None
 
     @abstractmethod
     async def prepare(
@@ -47,30 +53,43 @@ class RollingSummaryProvider(ContextProvider):
         summarizer_model: str,
         window_turns: int,
         trigger_tokens: int,
+        summarize_opts: dict | None = None,
     ):
         self.backend = backend
         self.store = store
         self.summarizer_model = summarizer_model
         self.window_turns = window_turns
         self.trigger_tokens = trigger_tokens
+        # num_ctx / think / keep_alive for the summarize() call — without num_ctx
+        # Ollama would silently truncate a long transcript at its 4096 default.
+        self.summarize_opts = summarize_opts or {}
 
-    async def prepare(self, session_id, session, turns):
+    def _split(self, session: dict, turns: list[Turn]):
         recent = turns[-self.window_turns :]
         older = turns[: -self.window_turns] if len(turns) > self.window_turns else []
-
-        summary = session.get("summary", "")
-        summarized_count = session.get("summarized_count", 0)
-        unsummarized = older[summarized_count:]
-
+        unsummarized = older[session.get("summarized_count", 0) :]
         total_tokens = sum(estimate_tokens(t.content) for t in turns)
         # trigger_tokens <= 0 means "summarize as soon as there's anything to fold
         # in" rather than "never" — avoids silently dropping older turns.
-        if unsummarized and total_tokens >= self.trigger_tokens:
+        should = bool(unsummarized) and total_tokens >= self.trigger_tokens
+        return recent, older, unsummarized, should
+
+    def pending_work(self, session, turns):
+        if self._split(session, turns)[3]:
+            return "Summarizing earlier conversation…"
+        return None
+
+    async def prepare(self, session_id, session, turns):
+        recent, older, unsummarized, should = self._split(session, turns)
+        summary = session.get("summary", "")
+
+        if should:
             transcript = "\n".join(f"{t.role}: {t.content}" for t in unsummarized)
             if summary:
                 transcript = f"[Previous summary]\n{summary}\n\n[New turns]\n{transcript}"
-            summary = await self.backend.summarize(transcript, self.summarizer_model)
-            summarized_count = len(older)
-            await self.store.update_summary(session_id, summary, summarized_count)
+            summary = await self.backend.summarize(
+                transcript, self.summarizer_model, **self.summarize_opts
+            )
+            await self.store.update_summary(session_id, summary, len(older))
 
         return _to_dicts(recent), summary

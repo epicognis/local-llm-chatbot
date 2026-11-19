@@ -116,9 +116,27 @@ body {
 }
 @keyframes blink { 50% { opacity: 0; } }
 
-.bubble.status {
+.bubble.status::before {
+  content: attr(data-status);
   color: #888;
   font-style: italic;
+}
+
+.error-note {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: #fdecea;
+  color: #b71c1c;
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+.bubble > .error-note:first-child { margin-top: 0; }
+
+.bubble.stopped::after {
+  content: " [stopped]";
+  color: #999;
+  font-size: 12px;
 }
 
 /* ── Input area ── */
@@ -156,6 +174,20 @@ body {
 }
 #send-btn:hover:not(:disabled) { background: #303f9f; }
 #send-btn:disabled { background: #aaa; cursor: default; }
+
+#stop-btn {
+  padding: 0 18px;
+  border: 1px solid #c62828;
+  border-radius: 8px;
+  background: #fff;
+  color: #c62828;
+  font-size: 14px;
+  cursor: pointer;
+  align-self: flex-end;
+  height: 38px;
+}
+#stop-btn:hover { background: #fdecea; }
+[hidden] { display: none !important; }
 
 /* ── Sidebar toggle (mobile) ── */
 #sidebar-toggle {

@@ -29,6 +29,7 @@
     <textarea id="msg-input" rows="3"
       placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
     <button id="send-btn" onclick="sendMessage()">Send</button>
+    <button id="stop-btn" onclick="stopStreaming()" hidden>Stop</button>
   </div>
 </div>
 
@@ -37,6 +38,8 @@
 
   let currentSessionId = null;
   let isStreaming = false;
+  let activeController = null;   // AbortController for the in-flight /chat request
+  let stopRequested = false;
 
   // crypto.randomUUID() only exists in secure contexts (HTTPS or localhost);
   // this app is served over plain HTTP on the LAN for phone access, so fall
@@ -58,7 +61,10 @@
     await loadSessions();
     newSession({ collapse: false });
     collapseSidebar(); // start collapsed on phones so the input isn't hidden under the overlay
-    document.getElementById('model-picker').addEventListener('change', collapseSidebar);
+    document.getElementById('model-picker').addEventListener('change', e => {
+      try { localStorage.setItem('model', e.target.value); } catch (_) {}
+      collapseSidebar();
+    });
   }
 
   // ── Sidebar collapse (mobile) ──────────────────────────
@@ -79,11 +85,14 @@
     const res = await fetch('/models');
     const models = await res.json();
     const picker = document.getElementById('model-picker');
+    let saved = null;
+    try { saved = localStorage.getItem('model'); } catch (_) {}
+    const preferred = models.some(m => m.name === saved) ? saved : DEFAULT_MODEL;
     models.forEach(m => {
       const opt = document.createElement('option');
       opt.value = m.name;
       opt.textContent = `${m.name} (ctx-${m.default_ctx})`;
-      if (m.name === DEFAULT_MODEL) opt.selected = true;
+      if (m.name === preferred) opt.selected = true;
       picker.appendChild(opt);
     });
   }
@@ -183,6 +192,25 @@
 
   // ── Send & stream ──────────────────────────────────────
 
+  function setStreaming(on) {
+    isStreaming = on;
+    document.getElementById('send-btn').hidden = on;
+    document.getElementById('stop-btn').hidden = !on;
+  }
+
+  function stopStreaming() {
+    if (!activeController) return;
+    stopRequested = true;
+    activeController.abort();   // server sees the disconnect and aborts the Ollama call
+  }
+
+  function showError(bubble, text) {
+    const err = document.createElement('div');
+    err.className = 'error-note';
+    err.textContent = text;
+    bubble.appendChild(err);
+  }
+
   async function sendMessage() {
     if (isStreaming) return;
     const input = document.getElementById('msg-input');
@@ -196,21 +224,39 @@
     const model = document.getElementById('model-picker').value;
     const aiBubble = appendMessage('assistant', '');
     aiBubble.classList.add('streaming');
+    const transcript = document.getElementById('transcript');
+    const textNode = document.createTextNode('');
+    aiBubble.appendChild(textNode);
 
-    isStreaming = true;
-    document.getElementById('send-btn').disabled = true;
+    setStreaming(true);
+    stopRequested = false;
 
-    // Watchdog: if the server goes completely silent (hung/zombie process,
-    // dropped connection) for this long, give up instead of leaving the UI
-    // stuck disabled forever. Reset on every chunk, so long-but-active
-    // streams (slow models, cold loads) are never cut off.
+    // Watchdog: the server sends a keepalive at least every few seconds while
+    // a turn is in progress, so a minute of total silence means it's gone.
     const controller = new AbortController();
+    activeController = controller;
     let watchdog;
     const resetWatchdog = () => {
       clearTimeout(watchdog);
-      watchdog = setTimeout(() => controller.abort(), 120000);
+      watchdog = setTimeout(() => controller.abort(), 60000);
     };
     resetWatchdog();
+
+    const handleEvent = (event) => {
+      if (event.type === 'status') {
+        if (!textNode.data) {
+          aiBubble.dataset.status = '⏳ ' + event.text;
+          aiBubble.classList.add('status');
+        }
+      } else if (event.type === 'token') {
+        aiBubble.classList.remove('status');
+        textNode.data += event.text;
+      } else if (event.type === 'error') {
+        aiBubble.classList.remove('status');
+        showError(aiBubble, event.text);
+      }
+      transcript.scrollTop = transcript.scrollHeight;
+    };
 
     try {
       const response = await fetch('/chat', {
@@ -219,6 +265,11 @@
         body: JSON.stringify({ session_id: currentSessionId, message, model }),
         signal: controller.signal,
       });
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try { detail += ': ' + JSON.stringify((await response.json()).detail); } catch (_) {}
+        throw new Error(detail);
+      }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -232,36 +283,28 @@
         const lines = buffer.split('\n');
         buffer = lines.pop(); // keep incomplete line
         for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
+          if (!line.startsWith('data: ')) continue;   // blank separators, ": keepalive"
           const raw = line.slice(6);
-          if (raw === '[DONE]') break;
-          try {
-            const event = JSON.parse(raw);
-            if (event.type === 'status') {
-              aiBubble.textContent = '⏳ ' + event.text;
-              aiBubble.classList.add('status');
-            } else {
-              if (aiBubble.classList.contains('status')) {
-                aiBubble.textContent = '';
-                aiBubble.classList.remove('status');
-              }
-              aiBubble.textContent += event.text;
-            }
-            aiBubble.parentElement.parentElement.scrollTop =
-              aiBubble.parentElement.parentElement.scrollHeight;
-          } catch (_) { /* skip malformed chunk */ }
+          if (raw === '[DONE]') continue;
+          try { handleEvent(JSON.parse(raw)); } catch (_) { /* skip malformed chunk */ }
         }
       }
     } catch (err) {
-      const reason = err.name === 'AbortError'
-        ? 'No response from the server for 2 minutes — giving up. The server may be stuck; try again.'
-        : err.message;
-      aiBubble.textContent += '\n[Connection error: ' + reason + ']';
+      aiBubble.classList.remove('status');
+      if (err.name === 'AbortError') {
+        if (stopRequested) aiBubble.classList.add('stopped');
+        else showError(aiBubble, 'No response from the server for 60 seconds — giving up. The server may be stuck; try again.');
+      } else {
+        showError(aiBubble, 'Connection error: ' + err.message);
+      }
     } finally {
       clearTimeout(watchdog);
-      aiBubble.classList.remove('streaming');
-      isStreaming = false;
-      document.getElementById('send-btn').disabled = false;
+      activeController = null;
+      aiBubble.classList.remove('streaming', 'status');
+      if (!textNode.data && !aiBubble.querySelector('.error-note') && !stopRequested) {
+        showError(aiBubble, 'Empty response.');
+      }
+      setStreaming(false);
       loadSessions(); // refresh list (new session appears)
     }
   }

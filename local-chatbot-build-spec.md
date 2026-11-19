@@ -167,9 +167,9 @@ class LLMBackend(ABC):
 - **GPT-OSS 20B** populates *both* fields per chunk simultaneously — reasoning in `thinking`, the answer in `content`. A naive "fall back to `thinking` when `content` is empty" fix (which rescues Qwen3) **backfires here**: it streams raw chain-of-thought live, then appends the real answer — leaking the model's internal reasoning into the chat UI.
 
 **Required handling (verified against both models):**
-1. Send `"think": false` by default — clean, direct answers with no reasoning-latency tax. *(Reasoning quality drops on hard tasks, so expose `think` as a per-model / per-request option for callers who want it — see below.)*
+1. Send the model's minimal reasoning setting by default — clean, direct answers with no reasoning-latency tax. For Qwen3 / Gemma 4 that is `"think": false`. **GPT-OSS cannot turn reasoning off:** with `"think": false` it still emitted ~2,000 hidden `thinking` tokens (~47 s) before the first visible word on a 1500-word prompt; `"think": "low"` emitted ~10 (first word at 0.7 s). Carry the value per model in the registry (`think: false | "low" | None`). *(Verified.)* *(Reasoning quality drops on hard tasks, so expose `think` as a per-model / per-request option for callers who want it — see below.)*
 2. **Only ever stream `message.content` live.** Never stream `message.thinking` to the UI.
-3. **Buffer `message.thinking` silently.** Use it **only** as a last-resort fallback if `content` stayed completely empty for the whole turn — so nothing is lost if a future model only ever populates `thinking`.
+3. **Buffer `message.thinking` silently.** Use it **only** as a last-resort fallback if `content` stayed completely empty for the whole turn — so nothing is lost if a future model only ever populates `thinking`. **Exception:** if the turn ended with `done_reason: "length"`, the buffer is half-finished chain-of-thought that ran out of `num_predict` — report an error instead of showing it. *(Verified.)*
 
 **If you later expose reasoning** (`think: true`): render `thinking` in a separate, collapsed "reasoning" affordance in the UI (with a "thinking…" indicator), never inline in the answer stream. Treat `think` as a per-model capability flag carried in the registry, not a global setting — Qwen3, GPT-OSS, and Gemma 4 all expose reasoning but format it differently.
 

@@ -198,6 +198,14 @@ Ollama defaults `num_ctx` to 4096 regardless of the model's real window. Now pas
 
 ---
 
+### Review & rebuild (2026-11-18)
+- **GPT-OSS `think: false` doesn't disable reasoning.** Measured on this card: ~2,000 hidden thinking tokens / ~47 s before the first visible word; `think: "low"` → ~10 tokens / 0.7 s. Registry now carries the per-model value (`false` / `"low"` / `None` for Llama). A reasoning phase surfaces a "Thinking…" status; reasoning that exhausts `num_predict` is reported as an error instead of being shown as the answer.
+- **Errors were persisted as assistant turns** (`[ERROR] …`, "No response…") and fed back to the model as history. Now a typed `error` SSE event; the user/assistant exchange is written atomically only once output exists.
+- **Disconnect dropped the partial reply** — Starlette's cancel scope also cancelled the persistence in `finally`. The turn now runs in its own task and the write is shielded; verified live (partial reply kept, GPU idle immediately).
+- **Unpulled models** (Qwen3 8B, Llama 3.1 8B) gave "Client error 404"; now fail fast with `ollama pull <tag>`. A resident model at a different `num_ctx` is detected as a reload and announced.
+- **Token calibration** (spec §7) implemented: per-model EMA of `prompt_eval_count / estimate`, floored at 1.0 so it can only tighten the hard guard. Ollama reports the full prompt count even on a cache hit (`prompt_eval_cached_count` is separate), so the signal is safe.
+- `summarize()` now gets `num_ctx` / `think` / `keep_alive`; tok/s uses Ollama's `eval_count / eval_duration`; UI gained Stop. All files were CRLF (broke `run.sh` under bash) — normalized, `.gitattributes` added.
+
 ## 11. Spec Updates Made This Session
 
 The build spec (`local-chatbot-build-spec.md`) was updated to capture all of the above:

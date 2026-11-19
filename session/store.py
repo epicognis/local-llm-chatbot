@@ -2,6 +2,8 @@ import aiosqlite
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from orchestrator.context_budget import estimate_tokens
+
 
 @dataclass
 class Turn:
@@ -48,6 +50,40 @@ class SessionStore:
                     ts          TEXT    NOT NULL DEFAULT (datetime('now'))
                 )
             """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id, id)"
+            )
+            await db.commit()
+
+    async def get_session(self, session_id: str) -> dict:
+        """Session metadata, or empty defaults if it doesn't exist yet. Unlike
+        get_or_create this never writes, so a turn that fails before producing
+        output doesn't leave an empty session in the sidebar."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT session_id, name, summary, summarized_count FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            return {"session_id": session_id, "name": "", "summary": "", "summarized_count": 0}
+        return {"session_id": row[0], "name": row[1], "summary": row[2], "summarized_count": row[3]}
+
+    async def append_exchange(self, session_id: str, user_message: str, assistant_reply: str):
+        """Persist a user turn and its reply atomically, creating the session if
+        needed — history always alternates user/assistant."""
+        ts = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO sessions (session_id) VALUES (?)", (session_id,)
+            )
+            await db.executemany(
+                "INSERT INTO turns (session_id, role, content, tokens, ts) VALUES (?,?,?,?,?)",
+                [
+                    (session_id, "user", user_message, estimate_tokens(user_message), ts),
+                    (session_id, "assistant", assistant_reply, estimate_tokens(assistant_reply), ts),
+                ],
+            )
             await db.commit()
 
     async def get_or_create(self, session_id: str) -> dict:
