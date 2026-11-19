@@ -1,136 +1,139 @@
-"""Orchestrator wiring: per-model runtime options, calibration, failure semantics."""
+"""Orchestrator wiring: per-model runtime options, failure/cancel semantics,
+calibration, readiness checks."""
 
+import anyio
 import pytest
 
-from config.settings import settings
+from config.settings import Settings
 from llm.backends.base import BackendError
 from llm.backends.mock_backend import MockBackend
-from orchestrator.context_budget import ContextBudgetAllocator, TokenCalibrator
+from llm.registry import Registry, UnknownModelError
+from orchestrator.context_budget import ContextBudget, ContextOverflowError
 from orchestrator.orchestrator import Orchestrator
 from session.store import SessionStore
 
 
-@pytest.fixture
-async def store(tmp_path):
-    s = SessionStore(f"sqlite:///{tmp_path / 'orch.db'}")
-    await s.init()
-    return s
+def make(tmp_path, backend=None, **settings_kw):
+    settings = Settings(llm_backend="mock", session_db_url=f"sqlite:///{tmp_path / 'o.db'}",
+                        **{"context_level": 0, **settings_kw})
+    backend = backend or MockBackend()
+    store = SessionStore(settings.session_db_url)
+    orch = Orchestrator(settings=settings, registry=Registry(), backend=backend, store=store,
+                        budget=ContextBudget(safety_margin=settings.context_safety_margin,
+                                             level=settings.context_level))
+    return orch, backend, store
 
 
-async def run_turn(orch, session_id="s", message="hello", model="Gemma 4 12B"):
-    return [e async for e in orch.chat_stream(session_id, message, model)]
+async def turn(orch, message="hello", model="Gemma 4 12B", session_id="s", **options):
+    return [e async for e in orch.generate(session_id=session_id, message=message,
+                                           model_name=model, options=options)]
 
 
-async def test_num_ctx_sent_from_registry_default_ctx(store):
-    backend = MockBackend(token_delay=0)
-    await run_turn(Orchestrator(backend, store), model="GPT-OSS 20B")
-    opts = backend.calls[0]["opts"]
-    assert opts["num_ctx"] == 131072  # never Ollama's silent 4096 default
-    assert opts["think"] == "low"     # GPT-OSS can't disable reasoning; "low" is minimal
-    assert opts["num_predict"] == settings.DEFAULT_MAX_TOKENS
+async def test_num_ctx_and_think_value_from_registry(tmp_path):
+    orch, backend, _ = make(tmp_path)
+    await turn(orch, model="GPT-OSS 20B")
+    call = backend.calls[-1]
+    assert call["num_ctx"] == 65536    # never Ollama's silent 4096 default
+    assert call["think"] == "low"      # GPT-OSS can't disable reasoning; "low" is minimal
+    await turn(orch, model="Gemma 4 12B")
+    assert backend.calls[-1]["think"] is False
+    await turn(orch, model="Llama 3.1 8B")
+    assert backend.calls[-1]["think"] is None   # no reasoning mode -> field omitted
 
 
-async def test_think_flag_only_sent_to_thinking_capable_models(store):
-    backend = MockBackend(token_delay=0)
-    await run_turn(Orchestrator(backend, store), model="Llama 3.1 8B")
-    assert "think" not in backend.calls[0]["opts"]
+async def test_thinking_mode_only_for_capable_models(tmp_path):
+    orch, backend, _ = make(tmp_path)
+    await turn(orch, model="Qwen3 8B", think=True)
+    assert backend.calls[-1]["think"] is True
+    await turn(orch, model="Llama 3.1 8B", think=True)
+    assert backend.calls[-1]["think"] is None
 
 
-async def test_history_alternates_and_is_replayed_next_turn(store):
-    backend = MockBackend(token_delay=0)
-    orch = Orchestrator(backend, store)
-    await run_turn(orch, message="first")
-    await run_turn(orch, message="second")
-    roles = [m["role"] for m in backend.calls[1]["messages"]]
-    assert roles == ["system", "user", "assistant", "user"]
-    assert [t.role for t in await store.get_turns("s")] == ["user", "assistant"] * 2
+async def test_history_alternates_and_is_replayed(tmp_path):
+    orch, backend, store = make(tmp_path)
+    await turn(orch, message="first")
+    await turn(orch, message="second")
+    assert [m["role"] for m in backend.calls[-1]["messages"]] == ["system", "user", "assistant", "user"]
+    assert [t["role"] for t in store.get_turns("s")] == ["user", "assistant"] * 2
 
 
-async def test_failed_turn_persists_nothing(store):
+async def test_failed_turn_persists_nothing(tmp_path):
     class Broken(MockBackend):
-        def _chat_stream(self, messages, model, **opts):
-            async def gen():
-                raise BackendError("boom")
-                yield  # pragma: no cover
-            return gen()
+        async def chat(self, messages, model, **kw):
+            raise BackendError("boom")
+            yield  # pragma: no cover
 
-    orch = Orchestrator(Broken(), store)
+    orch, _, store = make(tmp_path, backend=Broken())
     with pytest.raises(BackendError):
-        await run_turn(orch)
-    assert await store.get_turns("s") == []
-    assert await store.list_sessions() == []
+        await turn(orch)
+    assert store.get_turns("s") == [] and store.list_sessions() == []
 
 
-async def test_level2_summarize_gets_runtime_opts_and_status_event(store, monkeypatch):
-    monkeypatch.setattr(settings, "CONTEXT_LEVEL", 2)
-    monkeypatch.setattr(settings, "SLIDING_WINDOW_TURNS", 2)
-    monkeypatch.setattr(settings, "SUMMARY_TRIGGER_TOKENS", 0)
-    backend = MockBackend(token_delay=0)
-    orch = Orchestrator(backend, store)
-    await run_turn(orch, message="one")
-    await run_turn(orch, message="two")
-    events = await run_turn(orch, message="three")
-    assert {"type": "status", "text": "Summarizing earlier conversation…"} in events
-    assert len(backend.summarize_calls) == 1
-    sent = backend.calls[-1]["messages"]
-    assert sent[1]["content"].startswith("[Earlier conversation summary]")
+async def test_unknown_model_and_oversized_message_fail_before_storage(tmp_path):
+    orch, _, store = make(tmp_path)
+    with pytest.raises(UnknownModelError):
+        await turn(orch, model="Nope")
+    with pytest.raises(ContextOverflowError):
+        await turn(orch, message="x" * 400_000)
+    assert store.list_sessions() == []
 
 
-async def test_calibration_learns_from_prompt_eval_count(store):
-    class Undercounted(MockBackend):
-        """Reports 2x the heuristic's prompt tokens, like a tokenizer-hungry model."""
-        def _chat_stream(self, messages, model, **opts):
-            stats = opts.get("stats")
-            gen = super()._chat_stream(messages, model, **opts)
+async def test_missing_model_fails_fast(tmp_path):
+    class NotPulled(MockBackend):
+        async def warm_state(self, model, num_ctx=None):
+            return "missing"
 
-            async def wrap():
-                async for t in gen:
-                    yield t
-                from orchestrator.context_budget import estimate_messages
-                stats["prompt_eval_count"] = 2 * estimate_messages(messages)
-            return wrap()
-
-    orch = Orchestrator(Undercounted(token_delay=0), store)
-    await run_turn(orch)
-    assert orch.calibrator.ratio("gemma4:12b") == pytest.approx(2.0)
+    orch, backend, _ = make(tmp_path, backend=NotPulled())
+    with pytest.raises(BackendError, match="ollama pull gemma4:12b"):
+        await turn(orch)
+    assert backend.calls == []
 
 
-def test_calibrator_never_loosens_below_heuristic():
-    cal = TokenCalibrator()
-    assert cal.observe("m", estimated=100, actual=50) == 1.0
-    assert cal.observe("m", estimated=100, actual=200) == pytest.approx(1.0 + 0.3 * 1.0)
-    assert cal.observe("m", estimated=100, actual=None) == pytest.approx(1.3)
+async def test_cold_model_announces_loading(tmp_path):
+    class Cold(MockBackend):
+        async def warm_state(self, model, num_ctx=None):
+            return "reload"
+
+    orch, _, _ = make(tmp_path, backend=Cold())
+    evs = await turn(orch)
+    assert evs[0]["status"] == "loading" and "32,768" in evs[0]["text"]
 
 
-def test_calibrated_ratio_tightens_the_hard_guard():
-    turns = [{"role": "user", "content": "x" * 400}] * 10  # 100 est. tokens each
-    loose = ContextBudgetAllocator(model_ctx=2000, max_tokens=100, safety_margin=100)
-    tight = ContextBudgetAllocator(model_ctx=2000, max_tokens=100, safety_margin=100, ratio=2.0)
-    n_loose = len(loose.assemble("sys", turns, "q"))
-    n_tight = len(tight.assemble("sys", turns, "q"))
-    assert n_tight < n_loose
-
-
-def test_oversized_message_is_refused():
-    alloc = ContextBudgetAllocator(model_ctx=1000, max_tokens=100, safety_margin=100)
-    with pytest.raises(ValueError, match="too long"):
-        alloc.assemble("sys", [], "x" * 10_000)
-
-
-async def test_partial_reply_survives_level_triggered_cancellation(store):
+async def test_partial_reply_survives_cancellation(tmp_path):
     """Starlette cancels a disconnected response via an anyio cancel scope, which
-    re-cancels every await — including the persistence in chat_stream's finally.
-    The shielded write must still land."""
-    import anyio
-
-    orch = Orchestrator(MockBackend(token_delay=0.01), store)
+    re-cancels every await. The (synchronous) write in chat's finally must land."""
+    orch, _, store = make(tmp_path, backend=MockBackend(token_delay=0.01))
     seen = 0
     with anyio.CancelScope() as scope:
-        async for ev in orch.chat_stream("s", "hello", "Gemma 4 12B"):
-            if ev["type"] == "token":
+        async for ev in orch.generate(session_id="c", message="hello",
+                                      model_name="Gemma 4 12B", options={}):
+            if "delta" in ev:
                 seen += 1
                 if seen == 3:
                     scope.cancel()
-    turns = await store.get_turns("s")
-    assert [t.role for t in turns] == ["user", "assistant"]
-    assert turns[1].content.startswith("[MOCK] You said:")
+    turns = store.get_turns("c")
+    assert [t["role"] for t in turns] == ["user", "assistant"]
+    assert turns[1]["content"].startswith("[mock:gemma4:12b]")
+
+
+async def test_calibration_learns_per_model_from_prompt_eval_count(tmp_path):
+    class Hungry(MockBackend):
+        """Reports ~2x the heuristic's prompt tokens, like a token-hungry tokenizer."""
+        async def chat(self, messages, model, **kw):
+            async for ev in super().chat(messages, model, **kw):
+                if ev.done:
+                    ev.prompt_eval_count = sum(len(m["content"]) for m in messages) // 2
+                yield ev
+
+    orch, _, _ = make(tmp_path, backend=Hungry())
+    for _ in range(5):
+        await turn(orch, model="Gemma 4 12B")
+    assert orch.budget.chars_per_token("gemma4:12b") < 3.0
+    assert orch.budget.chars_per_token("gpt-oss:20b") == 4.0
+
+
+async def test_level0_overflow_refuses_with_guidance(tmp_path):
+    orch, _, store = make(tmp_path)
+    store.append_exchange("big", "Gemma 4 12B", "x" * 80_000, "y" * 80_000)
+    with pytest.raises(ContextOverflowError, match="CONTEXT_LEVEL=2"):
+        await turn(orch, session_id="big", num_ctx=8192)

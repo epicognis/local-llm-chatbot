@@ -1,113 +1,180 @@
-"""HTTP-level tests (spec §13) against MockBackend and a temp SQLite store.
-Drives the ASGI app in-process — no GPU, no network, no uvicorn."""
+"""End-to-end API tests against the MockBackend (no GPU, no network)."""
 
 import asyncio
 import json
 
-import httpx
 import pytest
+from fastapi.testclient import TestClient
 
-from api.main import app
-from config.settings import settings
-from llm.backends.base import BackendError, LLMBackend
+from api.main import create_app
+from config.settings import Settings
+from llm.backends.base import BackendError, ChatEvent, LLMBackend
 from llm.backends.mock_backend import MockBackend
-from llm.registry import MODEL_REGISTRY
-from orchestrator.orchestrator import Orchestrator
-from session.store import SessionStore
-
-MODEL = "Gemma 4 12B"
 
 
-@pytest.fixture
-async def store(tmp_path):
-    s = SessionStore(f"sqlite:///{tmp_path / 'api.db'}")
-    await s.init()
-    return s
-
-
-def install(store, backend):
-    # Calling the ASGI app directly doesn't run lifespan, so wire state by hand.
-    app.state.store = store
-    app.state.backend = backend
-    app.state.orchestrator = Orchestrator(backend, store)
+def make_settings(tmp_path, **kw):
+    return Settings(llm_backend="mock", session_db_url=f"sqlite:///{tmp_path / 'sessions.db'}",
+                    context_level=0, **kw)
 
 
 @pytest.fixture
-async def client(store):
-    install(store, MockBackend(token_delay=0))
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+def client(tmp_path):
+    with TestClient(create_app(make_settings(tmp_path))) as c:
         yield c
 
 
-def parse_sse(text: str) -> list:
-    events = []
+def events(text: str) -> list:
+    out = []
     for line in text.splitlines():
         if line.startswith("data: "):
             raw = line[6:]
-            events.append(raw if raw == "[DONE]" else json.loads(raw))
-    return events
+            out.append(raw if raw == "[DONE]" else json.loads(raw))
+    return out
 
 
-async def test_health_ok_without_ollama(client):
-    r = await client.get("/health")
-    assert r.status_code == 200
-    assert r.json()["status"] == "ok"
+def chat(client, **body):
+    body.setdefault("session_id", "s")
+    body.setdefault("message", "ping")
+    with client.stream("POST", "/chat", json=body) as res:
+        assert res.status_code == 200
+        return events("".join(res.iter_text()))
 
 
-async def test_models_lists_registry(client):
-    r = await client.get("/models")
-    assert r.json() == MODEL_REGISTRY
+def test_health_ok(client):
+    res = client.get("/health")
+    assert res.status_code == 200 and res.json()["status"] == "ok"
 
 
-async def test_ui_renders_with_default_model(client):
-    r = await client.get("/ui")
-    assert r.status_code == 200
-    assert json.dumps(settings.DEFAULT_MODEL) in r.text
+def test_models_listed_in_dropdown_order(client):
+    models = client.get("/models").json()
+    names = [m["name"] for m in models]
+    assert names[0] == "Gemma 4 12B"  # default first
+    assert names.index("Llama 3.1 8B") < names.index("Qwen3 14B")
+    assert all({"name", "model", "default_ctx", "supports_think"} <= m.keys() for m in models)
 
 
-async def test_chat_streams_and_persists_exchange(client):
-    r = await client.post("/chat", json={"session_id": "s1", "message": "hello", "model": MODEL})
-    assert r.headers["content-type"].startswith("text/event-stream")
-    events = parse_sse(r.text)
-    assert events[-1] == "[DONE]"
-    tokens = [e for e in events[:-1] if e["type"] == "token"]
-    assert len(tokens) > 3
-    assert "".join(e["text"] for e in tokens).startswith('[MOCK] You said: "hello"')
-
-    turns = (await client.get("/sessions/s1/turns")).json()
-    assert [t["role"] for t in turns] == ["user", "assistant"]
-    assert (await client.get("/sessions")).json()[0]["session_id"] == "s1"
+def test_load_resolves_tag_and_handles_unknown(client):
+    ok = client.post("/load", json={"model": "Gemma 4 12B"}).json()
+    assert ok["tag"] == "gemma4:12b" and ok["status"] == "noop"
+    bad = client.post("/load", json={"model": "Nope"})
+    assert bad.status_code == 200 and bad.json()["status"] == "error"
 
 
-async def test_unknown_model_is_error_event_and_creates_nothing(client):
-    r = await client.post("/chat", json={"session_id": "s2", "message": "hi", "model": "Nope 9B"})
-    events = parse_sse(r.text)
-    assert events[0]["type"] == "error"
-    assert "Unknown model 'Nope 9B'" in events[0]["text"]
-    assert events[-1] == "[DONE]"
-    assert (await client.get("/sessions")).json() == []
+def test_chat_streams_status_deltas_stats_done(client):
+    evs = chat(client, model="GPT-OSS 20B")
+    assert evs[0] == {"status": "prefill"}
+    text = "".join(e["delta"] for e in evs if isinstance(e, dict) and "delta" in e)
+    assert text.endswith("You said: ping")
+    stats = next(e["stats"] for e in evs if isinstance(e, dict) and "stats" in e)
+    assert stats["eval_count"]
+    assert evs[-1] == "[DONE]"
 
 
-async def test_empty_message_rejected(client):
-    r = await client.post("/chat", json={"session_id": "s", "message": ""})
-    assert r.status_code == 422
+def test_thinking_heartbeat_never_leaks_reasoning_text(client):
+    evs = chat(client, model="GPT-OSS 20B", options={"think": True})
+    assert any(isinstance(e, dict) and "thinking" in e for e in evs)
+    assert "think about" not in json.dumps(evs)
+
+
+def test_chat_persists_and_session_reloads(client):
+    chat(client, session_id="p", message="remember this", model="GPT-OSS 20B")
+    data = client.get("/sessions/p").json()
+    assert data["model"] == "GPT-OSS 20B"
+    assert data["turns"][0] == {"role": "user", "content": "remember this"}
+    assert data["turns"][1]["role"] == "assistant"
+
+
+def test_unknown_model_is_error_event_and_creates_nothing(client):
+    evs = chat(client, session_id="u", model="Nope 9B")
+    assert "Unknown model 'Nope 9B'" in evs[0]["error"]
+    assert evs[-1] == "[DONE]"
+    assert client.get("/sessions").json() == []
+
+
+def test_invalid_requests_rejected(client):
+    assert client.post("/chat", json={"session_id": "s", "message": ""}).status_code == 422
+    assert client.post("/chat", json={"session_id": "s", "message": "x",
+                                      "options": {"num_gpu": -1}}).status_code == 422
+
+
+def test_force_cpu_num_gpu_reaches_backend(client):
+    chat(client, model="GPT-OSS 20B", options={"num_gpu": 0, "num_ctx": 4096})
+    call = client.app.state.backend.calls[-1]
+    assert call["num_gpu"] == 0 and call["num_ctx"] == 4096
+
+
+def test_rename_and_delete_session(client):
+    chat(client, session_id="r")
+    assert client.patch("/sessions/r", json={"title": "My chat"}).json()["title"] == "My chat"
+    assert any(s["id"] == "r" and s["title"] == "My chat" for s in client.get("/sessions").json())
+    assert client.delete("/sessions/r").json()["deleted"] is True
+    assert client.get("/sessions/r").status_code == 404
+
+
+def test_rename_delete_unknown_session_404(client):
+    assert client.patch("/sessions/ghost", json={"title": "x"}).status_code == 404
+    assert client.delete("/sessions/ghost").status_code == 404
+
+
+def test_unload_others_enforced_once_per_model(client):
+    backend = client.app.state.backend
+    calls = []
+    orig = backend.unload_others
+
+    async def counting(keep_model):
+        calls.append(keep_model)
+        return await orig(keep_model)
+
+    backend.unload_others = counting
+    chat(client, model="GPT-OSS 20B")
+    chat(client, model="GPT-OSS 20B")          # same model -> skipped
+    assert calls == ["gpt-oss:20b"]
+    chat(client, model="Llama 3.1 8B")          # switch -> enforce again
+    assert calls == ["gpt-oss:20b", "llama3.1:8b"]
+
+
+def test_unload_all_purges(client):
+    body = client.post("/unload").json()
+    assert body == {"status": "ok", "before": [], "unloaded": [], "still_resident": []}
+
+
+def test_monitor_endpoint_always_200(client):
+    res = client.get("/monitor")
+    assert res.status_code == 200 and "available" in res.json()
+
+
+def test_ui_renders_with_controls_and_no_stale_cache(client):
+    res = client.get("/ui")
+    assert res.status_code == 200 and res.headers["cache-control"] == "no-store"
+    ui = res.text
+    for marker in ('id="cfg-auto-load"', 'id="purge-gpu"', 'id="sidebar-toggle"',
+                   'id="busy-canvas"', "/static/lissajous.js",
+                   'fetch("/sessions", { cache: "no-store" })'):
+        assert marker in ui
+    assert json.dumps("Gemma 4 12B") in ui
+    assert client.get("/static/lissajous.js").status_code == 200
+
+
+def test_root_redirects_to_ui(client):
+    res = client.get("/", follow_redirects=False)
+    assert res.status_code in (307, 308) and res.headers["location"] == "/ui"
+
+
+# ── failure + cancellation semantics ──────────────────────────────────────
 
 
 class FailingBackend(MockBackend):
-    def _chat_stream(self, messages, model, **opts):
-        async def gen():
-            raise BackendError("Model 'x' is not available in Ollama. Pull it first: ollama pull x")
-            yield  # pragma: no cover
-        return gen()
+    async def chat(self, messages, model, **kw):
+        raise BackendError("Model 'x' is not available in Ollama. Pull it first: ollama pull x")
+        yield  # pragma: no cover
 
 
-async def test_backend_error_is_not_persisted_as_assistant_text(store):
-    install(store, FailingBackend())
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post("/chat", json={"session_id": "s3", "message": "hi", "model": MODEL})
-    events = parse_sse(r.text)
-    assert events[0] == {"type": "error", "text": "Model 'x' is not available in Ollama. Pull it first: ollama pull x"}
-    assert await store.get_turns("s3") == []
+def test_backend_error_is_event_and_nothing_is_saved(tmp_path):
+    with TestClient(create_app(make_settings(tmp_path), backend=FailingBackend())) as c:
+        evs = chat(c, session_id="f", model="Gemma 4 12B")
+        assert {"error": "Model 'x' is not available in Ollama. Pull it first: ollama pull x"} in evs
+        assert c.app.state.store.get_turns("f") == []
+        assert c.get("/sessions").json() == []
 
 
 class SlowBackend(LLMBackend):
@@ -116,30 +183,24 @@ class SlowBackend(LLMBackend):
     def __init__(self):
         self.cancelled = asyncio.Event()
 
-    def _chat_stream(self, messages, model, **opts):
-        return self._gen()
-
-    async def _gen(self):
+    async def chat(self, messages, model, **kw):
         try:
             i = 0
             while True:
-                yield f"tok{i} "
+                yield ChatEvent(delta=f"tok{i} ")
                 i += 1
                 await asyncio.sleep(0.01)
         finally:
             self.cancelled.set()
 
-    async def _chat_complete(self, messages, model, **opts):
-        return ""
 
-
-async def test_client_disconnect_aborts_upstream_and_keeps_partial_reply(store):
+async def test_client_disconnect_aborts_upstream_and_keeps_partial_reply(tmp_path):
     backend = SlowBackend()
-    install(store, backend)
+    app = create_app(make_settings(tmp_path), backend=backend)
 
-    body = json.dumps({"session_id": "s4", "message": "go", "model": MODEL}).encode()
+    body = json.dumps({"session_id": "d", "message": "go", "model": "Gemma 4 12B"}).encode()
     disconnect = asyncio.Event()
-    received_chunks = 0
+    sent = 0
 
     async def receive():
         nonlocal body
@@ -150,10 +211,10 @@ async def test_client_disconnect_aborts_upstream_and_keeps_partial_reply(store):
         return {"type": "http.disconnect"}
 
     async def send(message):
-        nonlocal received_chunks
+        nonlocal sent
         if message["type"] == "http.response.body" and b"tok" in message.get("body", b""):
-            received_chunks += 1
-            if received_chunks >= 5:
+            sent += 1
+            if sent >= 5:
                 disconnect.set()
 
     scope = {
@@ -166,12 +227,11 @@ async def test_client_disconnect_aborts_upstream_and_keeps_partial_reply(store):
     await asyncio.wait_for(app(scope, receive, send), timeout=5)
     await asyncio.wait_for(backend.cancelled.wait(), timeout=5)
 
-    # The partial reply is persisted (shielded from the cancellation) and paired
-    # with its user turn.
+    store = app.state.store
     for _ in range(50):
-        turns = await store.get_turns("s4")
+        turns = store.get_turns("d")
         if turns:
             break
         await asyncio.sleep(0.02)
-    assert [t.role for t in turns] == ["user", "assistant"]
-    assert turns[1].content.startswith("tok0 tok1 ")
+    assert [t["role"] for t in turns] == ["user", "assistant"]
+    assert turns[1]["content"].startswith("tok0 tok1 ")

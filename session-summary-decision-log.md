@@ -206,6 +206,21 @@ Ollama defaults `num_ctx` to 4096 regardless of the model's real window. Now pas
 - **Token calibration** (spec §7) implemented: per-model EMA of `prompt_eval_count / estimate`, floored at 1.0 so it can only tighten the hard guard. Ollama reports the full prompt count even on a cache hit (`prompt_eval_cached_count` is separate), so the signal is safe.
 - `summarize()` now gets `num_ctx` / `think` / `keep_alive`; tok/s uses Ollama's `eval_count / eval_duration`; UI gained Stop. All files were CRLF (broke `run.sh` under bash) — normalized, `.gitattributes` added.
 
+### Upgrade: adopted the extended build (2026-11-18)
+A further-developed build of the same project (same spec and decision log as its starting point) was reviewed and adopted. Kept from it:
+- **Level 2 = recursive summarization** (`recursive_summarization/`, stdlib-only, contract-tested): passthrough while history fits (zero model calls), recursive map-reduce + tighten when it doesn't, cheap incremental `fold()` in steady state, full recompaction every `SUMMARY_RECOMPACT_CADENCE` folds; compaction state persisted per session. Replaces the simple rolling summary. `CONTEXT_LEVEL` now defaults to **2**.
+- **UI**: hardware-monitor panel (reuses `monitor/llmmon`), LLM Config panel (num_ctx, max tokens, temperature, top-p/k, thinking, keep-loaded, force-CPU, auto-load), Purge GPU, per-turn status line (waiting → thinking(N) → generating · tok/s → stats), stall watchdog, dark theme.
+- **Single resident model** (unload others on model switch), eager `/load`, `/unload`; richer session store (model per session, ordering by activity, compaction state).
+
+Fixed while adopting:
+- **`fold()` silently dropped turns**: when the working set fit the budget it was trimmed to `keep_recent_turns` without folding the trimmed turns into the summary — two turns of context lost per turn once a summary existed. Now the working set is kept whole until the next overflow folds it.
+- **Level 2 bypassed the hard window guard** (spec §7: mandatory at every level) — "recency wins" could overflow the window. Level 2 output now goes through the allocator with the summary reserved after the anchors.
+- Re-applied the earlier fixes the extended build lacked: `think: "low"` for GPT-OSS (also in summarize calls, where `false` cost ~2k hidden tokens each), errors as events never persisted, partial reply kept on disconnect, actionable Ollama errors, calibration that can only tighten (and is now per model), standalone-monitor log fields.
+- **Context windows re-measured** on this card: GPT-OSS 131072 spilled to CPU (89% GPU, ~47 tok/s) but **65536 fits 100% (~86 tok/s)**; Gemma 4 / Qwen3 8B / Llama 3.1 at 32768 all 100% GPU. The extended build's 8K for GPT-OSS was over-conservative.
+- Phone layout restored (sidebar drawer); monitor panel escapes daemon-supplied text.
+
+Dropped: branding, environment-specific diagnostics scripts and session logs, and an adapter for an unrelated project.
+
 ## 11. Spec Updates Made This Session
 
 The build spec (`local-chatbot-build-spec.md`) was updated to capture all of the above:

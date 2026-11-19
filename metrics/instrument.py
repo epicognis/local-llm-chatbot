@@ -1,51 +1,72 @@
+"""Per-turn metrics — tokens, latency, time-to-first-token, tokens/sec.
+
+Emits one ``turn_complete`` structlog line per turn. The standalone monitor
+(monitor/llmmon/turns.py) tails it for its tok/s panel and reads ``model``,
+``completion_tokens``, ``elapsed_s`` and ``tokens_per_sec`` — keep those stable.
+"""
+
+from __future__ import annotations
+
 import time
 
 import structlog
 
-log = structlog.get_logger()
+from llm.backends.base import ChatEvent
+
+log = structlog.get_logger("metrics")
 
 
 class TurnMetrics:
-    """Per-turn latency / throughput. Emits one `turn_complete` log line, which
-    the standalone monitor (monitor/llmmon/turns.py) tails for tok/s — keep the
-    field names stable."""
-
-    def __init__(self, session_id: str, model: str):
+    def __init__(self, session_id: str, model: str, prompt_tokens_est: int) -> None:
         self.session_id = session_id
         self.model = model
+        self.prompt_tokens_est = prompt_tokens_est
         self._start = time.monotonic()
-        self._first_token_at: float | None = None
-        self.chunks = 0
+        self._first: float | None = None
 
-    def count_token(self):
-        if self._first_token_at is None:
-            self._first_token_at = time.monotonic()
-        self.chunks += 1
+    def first_token(self) -> None:
+        if self._first is None:
+            self._first = time.monotonic()
 
-    def finish(self, stats: dict | None = None, **extra):
-        stats = stats or {}
-        elapsed = time.monotonic() - self._start
-        # Prefer the runtime's real counters; fall back to counting stream chunks
-        # (≈1 token per chunk for Ollama) when they're absent, e.g. on cancel.
-        completion_tokens = stats.get("eval_count") or self.chunks
-        eval_s = stats.get("eval_duration_s")
-        if eval_s:
-            tps = completion_tokens / eval_s  # pure decode rate
-        elif self._first_token_at is not None:
-            decode = time.monotonic() - self._first_token_at
-            tps = completion_tokens / decode if decode > 0 else 0.0
-        else:
-            tps = 0.0
-        ttft = (self._first_token_at - self._start) if self._first_token_at else None
+    @property
+    def ttft_s(self) -> float | None:
+        return None if self._first is None else self._first - self._start
+
+    def _tok_s(self, final: ChatEvent | None) -> float | None:
+        """Pure decode rate: the runtime's eval_count / eval_duration when known,
+        else generated tokens over the time since the first token."""
+        if final and final.eval_count and final.eval_duration_s:
+            return final.eval_count / final.eval_duration_s
+        if final and final.eval_count and self._first is not None:
+            decode = time.monotonic() - self._first
+            return final.eval_count / decode if decode > 0 else None
+        return None
+
+    def stats(self, final: ChatEvent | None, thinking_tokens: int) -> dict:
+        """The terminal ``stats`` event shown under the reply in the UI."""
+        tps = self._tok_s(final)
+        return {
+            "ttft_s": round(self.ttft_s, 2) if self.ttft_s is not None else None,
+            "eval_count": final.eval_count if final else None,
+            "tok_s": round(tps, 1) if tps else None,
+            "thinking_tokens": thinking_tokens,
+            "elapsed_s": round(time.monotonic() - self._start, 2),
+            "load_s": round(final.load_duration_s, 2) if final and final.load_duration_s else None,
+        }
+
+    def emit(self, final: ChatEvent | None, *, outcome: str, thinking_tokens: int = 0) -> None:
+        tps = self._tok_s(final)
         log.info(
             "turn_complete",
             session_id=self.session_id,
             model=self.model,
-            prompt_tokens=stats.get("prompt_eval_count", 0),
-            completion_tokens=completion_tokens,
-            elapsed_s=round(elapsed, 2),
-            ttft_s=round(ttft, 2) if ttft is not None else None,
-            tokens_per_sec=round(tps, 1),
-            load_s=round(stats["load_duration_s"], 2) if stats.get("load_duration_s") else None,
-            **extra,
+            outcome=outcome,
+            prompt_tokens_est=self.prompt_tokens_est,
+            prompt_tokens=final.prompt_eval_count if final else None,
+            completion_tokens=(final.eval_count if final else None) or 0,
+            thinking_tokens=thinking_tokens,
+            elapsed_s=round(time.monotonic() - self._start, 2),
+            ttft_s=round(self.ttft_s, 2) if self.ttft_s is not None else None,
+            tokens_per_sec=round(tps, 1) if tps else 0.0,
+            load_s=round(final.load_duration_s, 2) if final and final.load_duration_s else None,
         )

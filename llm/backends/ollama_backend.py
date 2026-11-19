@@ -1,33 +1,58 @@
+"""Ollama backend — streaming over the /api/chat endpoint.
+
+Why /api/chat and not /api/generate: Ollama applies each model's own chat template
+to role-tagged messages, so we never hand-maintain per-model prompt formatting.
+
+Hard-won rules baked in here (see build spec §6):
+
+1. ``num_ctx`` is sent explicitly per request. Ollama defaults it to 4096
+   regardless of the model's real window, silently capping long context.
+
+2. Reasoning models split output across ``message.content`` (the answer) and
+   ``message.thinking`` (chain-of-thought), inconsistently:
+     - Qwen3 can route everything to ``thinking`` (content empty).
+     - GPT-OSS fills BOTH per chunk, and can't fully disable reasoning
+       (the registry sends ``think: "low"`` for it).
+   So we only ever stream ``content`` as the answer. ``thinking`` is surfaced as
+   a liveness heartbeat and buffered — emitted as text only as a last-resort
+   fallback if the turn finished with no content at all. If the turn ran out of
+   ``num_predict`` mid-reasoning, the buffer is half-finished chain-of-thought,
+   so that's reported as an error instead of being shown.
+
+3. Errors are surfaced as :class:`BackendError` with an actionable message
+   (daemon not running, model not pulled -> ``ollama pull <tag>``, mid-stream
+   errors) — never streamed as if the model had said them.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
+from collections.abc import AsyncIterator
 
 import httpx
 import structlog
 
-from llm.backends.base import BackendError, LLMBackend, StreamStatus
+from .base import BackendError, ChatEvent, LLMBackend
 
-log = structlog.get_logger()
-
-_DURATION_FIELDS = ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration")
+log = structlog.get_logger(__name__)
 
 
-def _fill_stats(stats: dict | None, chunk: dict) -> None:
-    """Copy Ollama's end-of-turn counters into the caller's stats sink.
-    Durations arrive in nanoseconds; they're stored as seconds with an _s suffix."""
-    if stats is None:
-        return
-    for key in ("prompt_eval_count", "eval_count", "done_reason"):
-        if key in chunk:
-            stats[key] = chunk[key]
-    for key in _DURATION_FIELDS:
-        if chunk.get(key) is not None:
-            stats[f"{key}_s"] = chunk[key] / 1e9
+def _seconds(ns: int | None) -> float | None:
+    return ns / 1e9 if ns else None
 
 
 class OllamaBackend(LLMBackend):
-    def __init__(self, base_url: str, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
-        # One pooled client for the app's lifetime. No read timeout: a cold load
-        # of a large num_ctx can legitimately take minutes before the first byte.
+        # One pooled client for the app's lifetime. No read timeout: generation
+        # (or a cold load of a large num_ctx) can legitimately take minutes.
+        # Cancellation is handled by the caller closing the chat() generator,
+        # which exits the stream context and aborts the upstream request.
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=None),
@@ -40,19 +65,31 @@ class OllamaBackend(LLMBackend):
     # ── helpers ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _payload(messages: list[dict], model: str, stream: bool, opts: dict) -> tuple[dict, dict | None]:
-        opts = dict(opts)
-        stats = opts.pop("stats", None)
-        think = opts.pop("think", None)
-        keep_alive = opts.pop("keep_alive", None)
-        payload: dict = {"model": model, "messages": messages, "stream": stream}
-        if think is not None:
-            payload["think"] = think
-        if keep_alive is not None:
-            payload["keep_alive"] = keep_alive
-        if opts:
-            payload["options"] = opts
-        return payload, stats
+    def _options(
+        num_ctx: int | None,
+        num_gpu: int | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        top_p: float | None,
+        top_k: int | None,
+        extra: dict,
+    ) -> dict:
+        opts: dict = {}
+        if num_ctx is not None:
+            opts["num_ctx"] = num_ctx  # CRITICAL: else Ollama caps at 4096
+        if num_gpu is not None:
+            opts["num_gpu"] = num_gpu  # layers offloaded to GPU; 0 = full CPU
+        if temperature is not None:
+            opts["temperature"] = temperature
+        if max_tokens is not None:
+            opts["num_predict"] = max_tokens
+        if top_p is not None:
+            opts["top_p"] = top_p
+        if top_k is not None:
+            opts["top_k"] = top_k
+        # Pass-through for any other Ollama option (seed, repeat_penalty, ...).
+        opts.update(extra.get("options", {}))
+        return opts
 
     @staticmethod
     async def _raise_for_status(response: httpx.Response, model: str) -> None:
@@ -74,67 +111,83 @@ class OllamaBackend(LLMBackend):
 
     # ── chat ───────────────────────────────────────────────────────────
 
-    def _chat_stream(self, messages: list[dict], model: str, **opts):
-        return self._stream_from_ollama(messages, model, **opts)
+    async def chat(
+        self,
+        messages: list[dict],
+        model: str,
+        *,
+        num_ctx: int | None = None,
+        num_gpu: int | None = None,
+        think: bool | str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        keep_alive: int | str | None = None,
+        **opts,
+    ) -> AsyncIterator[ChatEvent]:
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": self._options(num_ctx, num_gpu, temperature, max_tokens, top_p, top_k, opts),
+        }
+        if think is not None:
+            payload["think"] = think
+        # keep_alive: how long Ollama holds the model resident after this request
+        # (-1 = indefinitely, 0 = unload now, else seconds or a duration string).
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
 
-    async def _stream_from_ollama(self, messages: list[dict], model: str, **opts):
-        payload, stats = self._payload(messages, model, True, opts)
-
-        content_emitted = False
-        thinking_buffer: list[str] = []
-        done_reason = None
+        content_seen = False
+        thinking_buf: list[str] = []
+        final: dict = {}
 
         try:
-            async with self._client.stream("POST", "/api/chat", json=payload) as response:
-                await self._raise_for_status(response, model)
-                async for line in response.aiter_lines():
+            async with self._client.stream("POST", "/api/chat", json=payload) as resp:
+                await self._raise_for_status(resp, model)
+                async for line in resp.aiter_lines():
+                    line = line.strip()
                     if not line:
                         continue
                     try:
                         chunk = json.loads(line)
                     except json.JSONDecodeError:
+                        log.warning("ollama_bad_json_line", line=line[:200])
                         continue
                     if "error" in chunk:
                         raise BackendError(f"Ollama error: {chunk['error']}")
+
                     msg = chunk.get("message") or {}
-                    # Reasoning models (spec §6): GPT-OSS fills both `content` and
-                    # `thinking` per chunk; Qwen3 may fill only `thinking`. Only
-                    # `content` is ever streamed live — `thinking` is buffered as
-                    # a last-resort fallback.
-                    content = msg.get("content", "")
+                    content = msg.get("content") or ""
+                    thinking = msg.get("thinking") or ""
                     if content:
-                        content_emitted = True
-                        yield content
-                    elif msg.get("thinking"):
-                        if not thinking_buffer:
-                            yield StreamStatus("Thinking…")
-                        thinking_buffer.append(msg["thinking"])
+                        content_seen = True
+                        yield ChatEvent(delta=content)
+                    elif thinking:
+                        thinking_buf.append(thinking)
+                        yield ChatEvent(thinking_delta=thinking)
+
                     if chunk.get("done"):
-                        done_reason = chunk.get("done_reason")
-                        _fill_stats(stats, chunk)
-                        log.debug(
-                            "ollama_turn_done",
-                            model=model,
-                            prompt_eval_count=chunk.get("prompt_eval_count"),
-                            eval_count=chunk.get("eval_count"),
-                            done_reason=chunk.get("done_reason"),
-                        )
+                        final = chunk
                         break
         except httpx.ConnectError:
             raise self._connect_error() from None
         except httpx.HTTPError as exc:
             raise BackendError(f"Lost connection to Ollama mid-stream: {exc!r}") from None
 
-        if not content_emitted:
-            if thinking_buffer and done_reason == "length":
-                # Reasoning used up num_predict before any answer: the buffer is
-                # half-finished chain-of-thought, not a reply — don't show it.
+        done_reason = final.get("done_reason")
+        if not content_seen:
+            if thinking_buf and done_reason == "length":
                 raise BackendError(
-                    "The model used its whole token budget reasoning and never got "
-                    "to an answer. Try again with a larger max_tokens."
+                    "The model used its whole token budget reasoning and never got to an "
+                    "answer. Try again with a larger Max tokens, or turn Thinking mode off."
                 )
-            if thinking_buffer:
-                yield "".join(thinking_buffer)
+            if thinking_buf:
+                # A turn that produced ONLY (finished) reasoning still yields a
+                # visible answer rather than dead air.
+                log.info("ollama_thinking_fallback", model=model)
+                yield ChatEvent(delta="".join(thinking_buf), from_thinking=True)
             else:
                 # Ollama can return a clean "done" with zero output, e.g. when a
                 # large-num_ctx cold load doesn't finish in time.
@@ -143,47 +196,124 @@ class OllamaBackend(LLMBackend):
                     "(large context windows can take a while to warm up). Please try again."
                 )
 
-    async def _chat_complete(self, messages: list[dict], model: str, **opts) -> str:
-        payload, stats = self._payload(messages, model, False, opts)
+        yield ChatEvent(
+            done=True,
+            prompt_eval_count=final.get("prompt_eval_count"),
+            eval_count=final.get("eval_count"),
+            eval_duration_s=_seconds(final.get("eval_duration")),
+            load_duration_s=_seconds(final.get("load_duration")),
+            done_reason=done_reason,
+        )
+
+    # ── residency / loading ───────────────────────────────────────────
+
+    async def _ps(self) -> list[dict]:
+        resp = await self._client.get("/api/ps", timeout=5)
+        resp.raise_for_status()
+        return resp.json().get("models") or []
+
+    async def version(self) -> str:
+        """Daemon version; raises if Ollama isn't reachable (used by /health)."""
+        resp = await self._client.get("/api/version", timeout=3)
+        resp.raise_for_status()
+        return resp.json().get("version", "?")
+
+    async def resident_models(self) -> list[str]:
         try:
-            response = await self._client.post("/api/chat", json=payload)
-        except httpx.ConnectError:
-            raise self._connect_error() from None
-        except httpx.HTTPError as exc:
-            raise BackendError(f"Ollama request failed: {exc!r}") from None
-        await self._raise_for_status(response, model)
-        data = response.json()
-        if "error" in data:
-            raise BackendError(f"Ollama error: {data['error']}")
-        _fill_stats(stats, data)
-        msg = data.get("message") or {}
-        text = msg.get("content") or msg.get("thinking") or ""
-        if not text:
-            raise BackendError("The model returned an empty response.")
-        return text
+            return [t for m in await self._ps() if (t := m.get("name") or m.get("model"))]
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("ollama_ps_failed", error=str(exc))
+            return []
 
     async def warm_state(self, model: str, num_ctx: int | None = None) -> str:
         # Best effort: any hiccup reports "warm" so chat is never blocked by it.
         try:
-            resp = await self._client.get("/api/ps", timeout=3)
-            if resp.status_code != 200:
-                return "warm"
-            for m in resp.json().get("models", []):
+            for m in await self._ps():
                 if m.get("name") == model:
                     loaded_ctx = m.get("context_length")
                     if num_ctx and loaded_ctx and loaded_ctx != num_ctx:
                         return "reload"
                     return "warm"
-            tags = await self._client.get("/api/tags", timeout=3)
+            tags = await self._client.get("/api/tags", timeout=5)
             if tags.status_code == 200 and not any(
                 m.get("name") == model for m in tags.json().get("models", [])
             ):
                 return "missing"
             return "cold"
-        except Exception:
+        except Exception:  # noqa: BLE001
             return "warm"
 
-    async def loaded_models(self) -> list[str]:
-        resp = await self._client.get("/api/ps", timeout=3)
-        resp.raise_for_status()
-        return [m["name"] for m in resp.json().get("models", [])]
+    async def _unload(self, tag: str, timeout: float | None = 30) -> None:
+        await self._client.post(
+            "/api/generate", json={"model": tag, "keep_alive": 0}, timeout=timeout
+        )
+
+    async def unload_others(self, keep_model: str) -> list[str]:
+        """Single-model enforcement: unload every resident model except ``keep_model``."""
+        unloaded: list[str] = []
+        try:
+            for tag in await self.resident_models():
+                if tag != keep_model:
+                    await self._unload(tag)
+                    unloaded.append(tag)
+        except httpx.HTTPError as exc:
+            log.warning("ollama_purge_failed", error=str(exc))
+        if unloaded:
+            log.info("ollama_unloaded_others", kept=keep_model, unloaded=unloaded)
+        return unloaded
+
+    async def unload_all(self) -> dict:
+        """Unload every resident model, then re-check ``/api/ps`` to confirm.
+
+        Bounded: a model that is mid-generation can't unload until its in-flight
+        request finishes, so each unload has a short timeout — better to report
+        "still_resident" quickly than block the caller for minutes.
+        """
+        before = await self.resident_models()
+        for tag in before:
+            try:
+                await self._unload(tag, timeout=12)
+            except httpx.HTTPError as exc:
+                log.warning("ollama_unload_failed", model=tag, error=str(exc))
+        if before:
+            # Let the runner subprocess(es) exit and release VRAM before re-reading.
+            await asyncio.sleep(0.5)
+        after = await self.resident_models()
+        unloaded = [t for t in before if t not in after]
+        log.info("ollama_unloaded_all", before=before, unloaded=unloaded, still_resident=after)
+        return {"before": before, "unloaded": unloaded, "still_resident": after}
+
+    async def load(
+        self,
+        model: str,
+        *,
+        num_ctx: int | None = None,
+        num_gpu: int | None = None,
+        keep_alive: int | str | None = None,
+        purge_others: bool = False,
+    ) -> dict:
+        """Load a model ahead of the first turn via an empty ``/api/generate``.
+
+        ``num_ctx`` / ``num_gpu`` are passed so the runner is sized and placed to
+        match generation (no reload on the first turn).
+        """
+        unloaded = await self.unload_others(model) if purge_others else []
+        payload: dict = {"model": model}
+        options: dict = {}
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
+        if num_gpu is not None:
+            options["num_gpu"] = num_gpu
+        if options:
+            payload["options"] = options
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+        try:
+            resp = await self._client.post("/api/generate", json=payload)
+        except httpx.ConnectError:
+            raise self._connect_error() from None
+        await self._raise_for_status(resp, model)
+        data = resp.json() if resp.content else {}
+        log.info("ollama_model_loaded", model=model, num_ctx=num_ctx, num_gpu=num_gpu, unloaded=unloaded)
+        return {"status": "loaded", "model": model, "unloaded": unloaded,
+                "done_reason": data.get("done_reason")}

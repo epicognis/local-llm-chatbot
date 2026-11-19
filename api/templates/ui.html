@@ -1,324 +1,788 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Local Chatbot</title>
   <link rel="stylesheet" href="/static/chat.css" />
 </head>
 <body>
+  <button id="sidebar-toggle" type="button" aria-label="Show menu">☰</button>
+  <div id="sidebar-backdrop"></div>
+  <div id="app">
+    <aside id="sidebar">
+      <!-- Title upper-left, with the Lissajous activity animation directly to its
+           right — shown only while a turn is streaming. -->
+      <div id="brand">
+        <h1>Local Chatbot</h1>
+        <canvas id="busy-canvas" width="96" height="96" aria-hidden="true"></canvas>
+      </div>
 
-<!-- ── Left sidebar ── -->
-<button id="sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle sidebar">☰</button>
-<div id="sidebar-backdrop" onclick="toggleSidebar()"></div>
-<div id="sidebar">
-  <h3>Model</h3>
-  <select id="model-picker"></select>
+      <label class="field">
+        <span>Model</span>
+        <select id="model-select"></select>
+      </label>
 
-  <button id="new-session-btn" onclick="newSession()">+ New Session</button>
+      <button id="new-chat">+ New chat</button>
 
-  <h3>Sessions</h3>
-  <div id="session-list"></div>
-</div>
+      <!-- Real-time hardware monitor: polls /monitor (reuses monitor/llmmon). -->
+      <section id="monitor">
+        <h2>
+          <span>Monitor</span>
+          <span id="monitor-dot" class="dot" title="live"></span>
+        </h2>
+        <div id="model-status" class="model-status idle">no model loaded</div>
+        <button id="purge-gpu" type="button" class="cfg-reset"
+                title="Unload all models from the Ollama daemon to free GPU/VRAM (and RAM) to zero.">Purge GPU (unload all)</button>
+        <div id="monitor-body" class="muted-note">starting…</div>
+      </section>
 
-<!-- ── Main chat pane ── -->
-<div id="main">
-  <div id="transcript"></div>
+      <!-- LLM config: external decoding knobs sent with each /chat turn. -->
+      <section id="llm-config">
+        <h2>LLM Config</h2>
 
-  <div id="input-area">
-    <textarea id="msg-input" rows="3"
-      placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
-    <button id="send-btn" onclick="sendMessage()">Send</button>
-    <button id="stop-btn" onclick="stopStreaming()" hidden>Stop</button>
+        <label class="cfg-row reasoning">
+          <input type="checkbox" id="think-toggle" />
+          <span>Thinking mode</span>
+        </label>
+
+        <label class="cfg-row reasoning">
+          <input type="checkbox" id="cfg-keep-alive" />
+          <span title="Keep the model resident in GPU memory between turns (Ollama keep_alive = -1). Off uses the daemon default (~5 min).">Keep model loaded</span>
+        </label>
+
+        <label class="cfg-row reasoning">
+          <input type="checkbox" id="cfg-force-cpu" />
+          <span title="Force the model to run on the host CPU (Ollama num_gpu = 0, no GPU offload). Toggling reloads the model. Use to demo CPU-vs-GPU response time.">Force CPU (host)</span>
+        </label>
+
+        <label class="cfg-row reasoning">
+          <input type="checkbox" id="cfg-auto-load" />
+          <span title="Eagerly load the selected model on connect and on model change (and purge other resident models). Default off = the model loads lazily on the first message.">Auto-load model</span>
+        </label>
+
+        <label class="cfg-row">
+          <span>Context size <small>(num_ctx)</small></span>
+          <input type="number" id="cfg-num-ctx" min="256" step="1024" />
+        </label>
+
+        <label class="cfg-row">
+          <span>Max tokens <small>(num_predict)</small></span>
+          <input type="number" id="cfg-max-tokens" min="1" step="64" />
+        </label>
+
+        <label class="cfg-row">
+          <span>Temperature</span>
+          <input type="number" id="cfg-temperature" min="0" max="2" step="0.1" />
+        </label>
+
+        <label class="cfg-row">
+          <span>Top-P</span>
+          <input type="number" id="cfg-top-p" min="0" max="1" step="0.05" />
+        </label>
+
+        <label class="cfg-row">
+          <span>Top-K</span>
+          <input type="number" id="cfg-top-k" min="0" step="1" />
+        </label>
+
+        <button id="cfg-reset" type="button" class="cfg-reset">Reset to defaults</button>
+      </section>
+
+      <h2>Sessions</h2>
+      <ul id="session-list"></ul>
+    </aside>
+
+    <main id="chat">
+      <div id="transcript"></div>
+      <form id="composer">
+        <textarea id="input" rows="2" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+        <button id="send" type="submit">Send</button>
+      </form>
+    </main>
   </div>
-</div>
 
-<script>
-  const DEFAULT_MODEL = {{ default_model | tojson }};
+  <script src="/static/lissajous.js"></script>
+  <script>
+    const DEFAULT_MODEL = {{ default_model | tojson }};
+    const CFG_DEFAULTS = {{ cfg_defaults | tojson }};
 
-  let currentSessionId = null;
-  let isStreaming = false;
-  let activeController = null;   // AbortController for the in-flight /chat request
-  let stopRequested = false;
+    const els = {
+      modelSelect: document.getElementById("model-select"),
+      thinkToggle: document.getElementById("think-toggle"),
+      cfgKeepAlive: document.getElementById("cfg-keep-alive"),
+      cfgForceCpu: document.getElementById("cfg-force-cpu"),
+      cfgAutoLoad: document.getElementById("cfg-auto-load"),
+      purgeGpu: document.getElementById("purge-gpu"),
+      cfgNumCtx: document.getElementById("cfg-num-ctx"),
+      cfgMaxTokens: document.getElementById("cfg-max-tokens"),
+      cfgTemperature: document.getElementById("cfg-temperature"),
+      cfgTopP: document.getElementById("cfg-top-p"),
+      cfgTopK: document.getElementById("cfg-top-k"),
+      cfgReset: document.getElementById("cfg-reset"),
+      newChat: document.getElementById("new-chat"),
+      sessionList: document.getElementById("session-list"),
+      transcript: document.getElementById("transcript"),
+      composer: document.getElementById("composer"),
+      input: document.getElementById("input"),
+      send: document.getElementById("send"),
+      busyCanvas: document.getElementById("busy-canvas"),
+      monitorBody: document.getElementById("monitor-body"),
+      monitorDot: document.getElementById("monitor-dot"),
+      modelStatus: document.getElementById("model-status"),
+    };
 
-  // crypto.randomUUID() only exists in secure contexts (HTTPS or localhost);
-  // this app is served over plain HTTP on the LAN for phone access, so fall
-  // back to a manual UUID v4 when it's unavailable.
-  function newUUID() {
-    if (window.crypto && typeof crypto.randomUUID === 'function') {
-      return crypto.randomUUID();
+    // Text from Ollama / nvidia-smi goes into innerHTML in the monitor panel.
+    function esc(v) {
+      return String(v ?? "").replace(/[&<>"']/g, (c) => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     }
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-      const r = Math.random() * 16 | 0;
-      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
-    });
-  }
 
-  // ── Bootstrap ──────────────────────────────────────────
+    // Phones / narrow windows: the sidebar is a slide-over drawer.
+    const isNarrow = () => window.matchMedia("(max-width: 760px)").matches;
+    function closeSidebar() { document.body.classList.remove("sidebar-open"); }
+    document.getElementById("sidebar-toggle").addEventListener("click",
+      () => document.body.classList.toggle("sidebar-open"));
+    document.getElementById("sidebar-backdrop").addEventListener("click", closeSidebar);
 
-  async function init() {
-    await loadModels();
-    await loadSessions();
-    newSession({ collapse: false });
-    collapseSidebar(); // start collapsed on phones so the input isn't hidden under the overlay
-    document.getElementById('model-picker').addEventListener('change', e => {
-      try { localStorage.setItem('model', e.target.value); } catch (_) {}
-      collapseSidebar();
-    });
-  }
+    function setBusy(on) {
+      els.busyCanvas.classList.toggle("active", on);
+      if (on) window.Lissajous.start(els.busyCanvas);
+      else window.Lissajous.stop();
+    }
 
-  // ── Sidebar collapse (mobile) ──────────────────────────
-
-  function isMobile() {
-    return window.matchMedia('(max-width: 700px)').matches;
-  }
-
-  function collapseSidebar() {
-    if (isMobile()) document.body.classList.add('sidebar-collapsed');
-  }
-
-  function toggleSidebar() {
-    document.body.classList.toggle('sidebar-collapsed');
-  }
-
-  async function loadModels() {
-    const res = await fetch('/models');
-    const models = await res.json();
-    const picker = document.getElementById('model-picker');
-    let saved = null;
-    try { saved = localStorage.getItem('model'); } catch (_) {}
-    const preferred = models.some(m => m.name === saved) ? saved : DEFAULT_MODEL;
-    models.forEach(m => {
-      const opt = document.createElement('option');
-      opt.value = m.name;
-      opt.textContent = `${m.name} (ctx-${m.default_ctx})`;
-      if (m.name === preferred) opt.selected = true;
-      picker.appendChild(opt);
-    });
-  }
-
-  async function loadSessions() {
-    const res = await fetch('/sessions');
-    const sessions = await res.json();
-    const list = document.getElementById('session-list');
-    list.innerHTML = '';
-    sessions.forEach(({ session_id: sid, name }) => {
-      const div = document.createElement('div');
-      div.className = 'session-item' + (sid === currentSessionId ? ' active' : '');
-      div.title = sid;
-
-      const label = document.createElement('span');
-      label.className = 'session-label';
-      label.textContent = name || (sid.slice(0, 8) + '…');
-      label.onclick = () => openSession(sid);
-      div.appendChild(label);
-
-      const renameBtn = document.createElement('button');
-      renameBtn.className = 'session-action';
-      renameBtn.textContent = '✎';
-      renameBtn.title = 'Rename session';
-      renameBtn.onclick = (e) => { e.stopPropagation(); renameSession(sid, name); };
-      div.appendChild(renameBtn);
-
-      const deleteBtn = document.createElement('button');
-      deleteBtn.className = 'session-action';
-      deleteBtn.textContent = '🗑';
-      deleteBtn.title = 'Delete session';
-      deleteBtn.onclick = (e) => { e.stopPropagation(); deleteSession(sid); };
-      div.appendChild(deleteBtn);
-
-      list.appendChild(div);
-    });
-  }
-
-  async function renameSession(sid, currentName) {
-    const name = prompt('Session name:', currentName || '');
-    if (name === null) return;
-    await fetch(`/sessions/${sid}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-    loadSessions();
-  }
-
-  async function deleteSession(sid) {
-    if (!confirm('Delete this session? This cannot be undone.')) return;
-    await fetch(`/sessions/${sid}`, { method: 'DELETE' });
-    if (sid === currentSessionId) newSession({ collapse: false });
-    else loadSessions();
-  }
-
-  // ── Session management ─────────────────────────────────
-
-  function newSession({ collapse = true } = {}) {
-    currentSessionId = newUUID();
-    document.getElementById('transcript').innerHTML = '';
-    loadSessions();
-    if (collapse) collapseSidebar();
-  }
-
-  async function openSession(sid) {
-    currentSessionId = sid;
-    const res = await fetch(`/sessions/${sid}/turns`);
-    const turns = await res.json();
-    const transcript = document.getElementById('transcript');
-    transcript.innerHTML = '';
-    turns.forEach(t => appendMessage(t.role, t.content));
-    highlightActive();
-    collapseSidebar();
-  }
-
-  function highlightActive() {
-    document.querySelectorAll('.session-item').forEach(el => {
-      el.classList.toggle('active', el.title === currentSessionId);
-    });
-  }
-
-  // ── Transcript helpers ─────────────────────────────────
-
-  function appendMessage(role, content) {
-    const transcript = document.getElementById('transcript');
-    const wrap = document.createElement('div');
-    wrap.className = `message ${role}`;
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    bubble.textContent = content;
-    wrap.appendChild(bubble);
-    transcript.appendChild(wrap);
-    transcript.scrollTop = transcript.scrollHeight;
-    return bubble;
-  }
-
-  // ── Send & stream ──────────────────────────────────────
-
-  function setStreaming(on) {
-    isStreaming = on;
-    document.getElementById('send-btn').hidden = on;
-    document.getElementById('stop-btn').hidden = !on;
-  }
-
-  function stopStreaming() {
-    if (!activeController) return;
-    stopRequested = true;
-    activeController.abort();   // server sees the disconnect and aborts the Ollama call
-  }
-
-  function showError(bubble, text) {
-    const err = document.createElement('div');
-    err.className = 'error-note';
-    err.textContent = text;
-    bubble.appendChild(err);
-  }
-
-  async function sendMessage() {
-    if (isStreaming) return;
-    const input = document.getElementById('msg-input');
-    const message = input.value.trim();
-    if (!message) return;
-    if (!currentSessionId) currentSessionId = newUUID();
-
-    input.value = '';
-    appendMessage('user', message);
-
-    const model = document.getElementById('model-picker').value;
-    const aiBubble = appendMessage('assistant', '');
-    aiBubble.classList.add('streaming');
-    const transcript = document.getElementById('transcript');
-    const textNode = document.createTextNode('');
-    aiBubble.appendChild(textNode);
-
-    setStreaming(true);
-    stopRequested = false;
-
-    // Watchdog: the server sends a keepalive at least every few seconds while
-    // a turn is in progress, so a minute of total silence means it's gone.
-    const controller = new AbortController();
-    activeController = controller;
-    let watchdog;
-    const resetWatchdog = () => {
-      clearTimeout(watchdog);
-      watchdog = setTimeout(() => controller.abort(), 60000);
-    };
-    resetWatchdog();
-
-    const handleEvent = (event) => {
-      if (event.type === 'status') {
-        if (!textNode.data) {
-          aiBubble.dataset.status = '⏳ ' + event.text;
-          aiBubble.classList.add('status');
-        }
-      } else if (event.type === 'token') {
-        aiBubble.classList.remove('status');
-        textNode.data += event.text;
-      } else if (event.type === 'error') {
-        aiBubble.classList.remove('status');
-        showError(aiBubble, event.text);
+    // crypto.randomUUID() exists only in secure contexts (HTTPS or localhost), so it
+    // is undefined when the page is served over plain HTTP via a LAN IP. Fall back to
+    // getRandomValues, then Math.random, so a session id is always available.
+    function newSessionId() {
+      if (crypto.randomUUID) return crypto.randomUUID().replace(/-/g, "");
+      if (crypto.getRandomValues) {
+        const b = crypto.getRandomValues(new Uint8Array(16));
+        return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
       }
-      transcript.scrollTop = transcript.scrollHeight;
-    };
+      return (Date.now().toString(16) + Math.random().toString(16).slice(2)).padStart(32, "0");
+    }
 
-    try {
-      const response = await fetch('/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: currentSessionId, message, model }),
-        signal: controller.signal,
+    let sessionId = newSessionId();
+    let streaming = false;
+    let modelsByName = {};
+    let abortController = null;        // lets the Stop button cancel an in-flight turn
+    const STALL_MS = 20000;           // no event for this long -> flag a possible stall
+
+    // Model-load status (shown under Monitor). chatState: idle | loading | generating.
+    // A turn against a not-yet-resident model triggers a cold load before the first
+    // token, so we surface "loading" until that token arrives.
+    let residentModels = [];
+    let chatState = "idle";
+    let activeModelTag = null;
+    let modelLoading = false;   // an eager /load is in flight
+    let loadTag = null;         // tag being loaded
+    let loadSeq = 0;            // guards against overlapping loads (last wins)
+
+    function makeBubble(role, text) {
+      const div = document.createElement("div");
+      div.className = `bubble ${role}`;
+      div.textContent = text;
+      return div;
+    }
+    function addBubble(role, text) {
+      const div = makeBubble(role, text);
+      els.transcript.appendChild(div);
+      els.transcript.scrollTop = els.transcript.scrollHeight;
+      return div;
+    }
+
+    function modelPlaceholder(text) {
+      // Show a disabled placeholder so a load failure is visible, not a silent
+      // empty dropdown (which reads as "models are gone" when they aren't).
+      els.modelSelect.innerHTML = "";
+      const opt = document.createElement("option");
+      opt.textContent = text;
+      opt.disabled = true;
+      els.modelSelect.appendChild(opt);
+    }
+
+    async function loadModels() {
+      let models;
+      try {
+        // no-store: the registry list is small + static, but a stale/empty cached
+        // response over plain-HTTP LAN would silently empty the dropdown.
+        const res = await fetch("/models", { cache: "no-store" });
+        if (!res.ok) throw new Error(`/models -> HTTP ${res.status}`);
+        models = await res.json();
+      } catch (e) {
+        console.error("loadModels failed:", e);
+        modelPlaceholder("⚠ failed to load models — reload page");
+        return;
+      }
+      if (!Array.isArray(models) || !models.length) {
+        modelPlaceholder("⚠ no models in registry");
+        return;
+      }
+      els.modelSelect.innerHTML = "";
+      for (const m of models) {
+        modelsByName[m.name] = m;
+        const opt = document.createElement("option");
+        opt.value = m.name;
+        opt.textContent = `${m.name}  (ctx ${m.default_ctx.toLocaleString()})`;
+        if (m.name === DEFAULT_MODEL) opt.selected = true;
+        els.modelSelect.appendChild(opt);
+      }
+      applyCfgDefaults();
+      syncThinkAvailability();
+    }
+
+    function syncThinkAvailability() {
+      const spec = modelsByName[els.modelSelect.value];
+      const ok = spec && spec.supports_think;
+      els.thinkToggle.disabled = !ok;
+      if (!ok) els.thinkToggle.checked = false;
+    }
+
+    // Seed the config inputs: sampling defaults come from the server; context size
+    // tracks the selected model's registry default_ctx.
+    function applyCfgDefaults() {
+      const spec = modelsByName[els.modelSelect.value];
+      els.cfgNumCtx.value = spec ? spec.default_ctx : "";
+      els.cfgMaxTokens.value = CFG_DEFAULTS.max_tokens;
+      els.cfgTemperature.value = CFG_DEFAULTS.temperature;
+      els.cfgTopP.value = CFG_DEFAULTS.top_p;
+      els.cfgTopK.value = CFG_DEFAULTS.top_k;
+      els.cfgKeepAlive.checked = false;
+      els.cfgForceCpu.checked = false;   // default: run on the GPU
+      els.cfgAutoLoad.checked = false;   // default: load lazily on first turn (no eager load)
+    }
+
+    // Refresh the config UI for the selected model: snap context size to its
+    // default and update think availability (no model load).
+    function refreshModelUi() {
+      const spec = modelsByName[els.modelSelect.value];
+      if (spec) els.cfgNumCtx.value = spec.default_ctx;
+      syncThinkAvailability();
+    }
+
+    // User picked a model from the dropdown: refresh the UI, then eagerly load it
+    // (and purge other resident models). The composer stays enabled throughout, so
+    // the user can write their prompt while the model loads.
+    function onModelChange() {
+      refreshModelUi();
+      autoLoadModel(els.modelSelect.value);
+    }
+
+    // Eagerly load `name` into the backend so it's resident before the first turn.
+    // Non-blocking: never disables the composer. Overlapping calls: last one wins.
+    async function autoLoadModel(name) {
+      if (!els.cfgAutoLoad.checked) return;   // auto-load disabled -> load lazily on first turn
+      const spec = modelsByName[name];
+      if (!spec) return;
+      const seq = ++loadSeq;
+      loadTag = spec.model;
+      modelLoading = true;
+      renderModelStatus();
+
+      const body = { model: name, purge_others: true };
+      const nc = parseFloat(els.cfgNumCtx.value);
+      if (Number.isFinite(nc)) body.num_ctx = Math.round(nc);
+      if (els.cfgKeepAlive.checked) body.keep_alive = -1;
+      // Force CPU: load with 0 GPU layers so the resident runner matches generation.
+      if (els.cfgForceCpu.checked) body.num_gpu = 0;
+      try {
+        await fetch("/load", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (_) { /* status line falls back to the monitor's resident view */ }
+      finally {
+        if (seq === loadSeq) { modelLoading = false; renderModelStatus(); }
+      }
+    }
+
+    // Purge all resident models from the Ollama daemon, freeing GPU/VRAM to zero.
+    // Manual action: does NOT delete weights and does NOT auto-reload — the model
+    // reloads lazily on the next turn. Self-resetting: shows the outcome (verified
+    // against /api/ps) for a moment, then returns to its idle label.
+    async function purgeGpu(label) {
+      els.purgeGpu.disabled = true;
+      els.purgeGpu.textContent = "purging…";
+      // Never let the button hang forever: abort the request after a bounded wait
+      // (a bit longer than the server's own per-model unload timeout).
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 40000);
+      let msg;
+      try {
+        const res = await fetch("/unload", { method: "POST", signal: ctrl.signal });
+        const r = await res.json();
+        if (r.status === "ok") {
+          const freed = (r.unloaded || []).length;
+          const stuck = r.still_resident || [];
+          msg = stuck.length
+              ? `⚠ still resident: ${stuck.join(", ")} — model busy? Stop the running turn, then retry`
+              : freed ? `✓ freed ${freed} model${freed > 1 ? "s" : ""}`
+              : "✓ nothing was loaded";
+        } else {
+          msg = `⚠ ${r.reason || "purge failed"}`;
+        }
+      } catch (e) {
+        msg = (e && e.name === "AbortError")
+          ? "⚠ purge timed out — Ollama busy? Stop any running turn, then retry"
+          : `⚠ ${e}`;
+      } finally {
+        clearTimeout(timer);
+      }
+      // Reflect a cleared state immediately; the monitor poll shows device VRAM.
+      chatState = "idle";
+      activeModelTag = null;
+      pollMonitor();
+      els.purgeGpu.textContent = msg;
+      setTimeout(() => {                       // self-reset back to the idle label
+        els.purgeGpu.textContent = label;
+        els.purgeGpu.disabled = false;
+      }, 3000);
+    }
+
+    // Read the config panel into the /chat `options` object. Numeric fields are
+    // sent only when filled and valid, so blanks fall back to server defaults.
+    function readCfgOptions() {
+      const opts = { think: els.thinkToggle.checked };
+      const num = (el) => {
+        const v = parseFloat(el.value);
+        return Number.isFinite(v) ? v : undefined;
+      };
+      const numCtx = num(els.cfgNumCtx), maxTok = num(els.cfgMaxTokens);
+      const temp = num(els.cfgTemperature), topP = num(els.cfgTopP), topK = num(els.cfgTopK);
+      if (numCtx !== undefined) opts.num_ctx = Math.round(numCtx);
+      if (maxTok !== undefined) opts.max_tokens = Math.round(maxTok);
+      if (temp !== undefined) opts.temperature = temp;
+      if (topP !== undefined) opts.top_p = topP;
+      if (topK !== undefined) opts.top_k = Math.round(topK);
+      // -1 keeps the model resident indefinitely; omit when off (daemon default).
+      if (els.cfgKeepAlive.checked) opts.keep_alive = -1;
+      // Force CPU: 0 layers offloaded to GPU. Omit when off (normal GPU path).
+      if (els.cfgForceCpu.checked) opts.num_gpu = 0;
+      return opts;
+    }
+
+    function sessionLabel(s) {
+      return s.title && s.title.trim()
+        ? s.title
+        : `${s.id.slice(0, 8)} · ${s.turn_count} turns`;
+    }
+
+    async function loadSessions() {
+      // no-store: the session list is mutable (rename/delete/new turn). Without it
+      // the browser can serve a stale cached list, so a just-deleted session keeps
+      // showing up. (Same reason the monitor poll below uses no-store.)
+      const res = await fetch("/sessions", { cache: "no-store" });
+      const sessions = await res.json();
+      els.sessionList.innerHTML = "";
+      for (const s of sessions) {
+        const li = document.createElement("li");
+        li.dataset.id = s.id;
+        if (s.id === sessionId) li.classList.add("active");
+
+        const label = document.createElement("span");
+        label.className = "session-label";
+        label.textContent = sessionLabel(s);
+        label.title = s.id;
+        label.onclick = () => { openSession(s.id); closeSidebar(); };
+
+        const actions = document.createElement("span");
+        actions.className = "session-actions";
+
+        const rename = document.createElement("button");
+        rename.className = "session-btn";
+        rename.title = "Rename";
+        rename.textContent = "✎";
+        rename.onclick = (e) => { e.stopPropagation(); renameSession(s); };
+
+        const del = document.createElement("button");
+        del.className = "session-btn danger";
+        del.title = "Delete";
+        del.textContent = "🗑";
+        del.onclick = (e) => { e.stopPropagation(); deleteSession(s); };
+
+        actions.append(rename, del);
+        li.append(label, actions);
+        els.sessionList.appendChild(li);
+      }
+    }
+
+    async function renameSession(s) {
+      const current = (s.title && s.title.trim()) ? s.title : "";
+      const title = prompt("Rename session:", current);
+      if (title === null) return;            // cancelled
+      const trimmed = title.trim();
+      if (!trimmed) return;                   // empty -> no-op
+      const res = await fetch(`/sessions/${s.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: trimmed }),
       });
-      if (!response.ok) {
-        let detail = `HTTP ${response.status}`;
-        try { detail += ': ' + JSON.stringify((await response.json()).detail); } catch (_) {}
-        throw new Error(detail);
+      if (res.ok) loadSessions();
+    }
+
+    async function deleteSession(s) {
+      if (!confirm(`Delete session "${sessionLabel(s)}"? This cannot be undone.`)) return;
+      const res = await fetch(`/sessions/${s.id}`, { method: "DELETE" });
+      if (!res.ok) return;
+      if (s.id === sessionId) newChat();      // were we viewing it? start fresh
+      else loadSessions();
+    }
+
+    // Move the "active" highlight in-place — no need to refetch/rebuild the whole
+    // list just to switch which session is being viewed.
+    function markActiveSession() {
+      for (const li of els.sessionList.children) {
+        li.classList.toggle("active", li.dataset.id === sessionId);
       }
+    }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
+    async function openSession(id) {
+      const res = await fetch(`/sessions/${id}`, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      sessionId = id;
+      if (data.model && modelsByName[data.model]) els.modelSelect.value = data.model;
+      // Batch the transcript into one fragment -> one reflow + one scroll (was an
+      // append + scrollTop per turn, which janks on long transcripts).
+      const frag = document.createDocumentFragment();
+      for (const t of data.turns) frag.appendChild(makeBubble(t.role, t.content));
+      els.transcript.innerHTML = "";
+      els.transcript.appendChild(frag);
+      els.transcript.scrollTop = els.transcript.scrollHeight;
+      refreshModelUi();       // reflect the session's model; load lazily on next turn
+      markActiveSession();    // cheap highlight update instead of a full loadSessions()
+    }
 
-      while (true) {
-        const { done, value } = await reader.read();
-        resetWatchdog();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep incomplete line
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;   // blank separators, ": keepalive"
-          const raw = line.slice(6);
-          if (raw === '[DONE]') continue;
-          try { handleEvent(JSON.parse(raw)); } catch (_) { /* skip malformed chunk */ }
+    function newChat() {
+      sessionId = newSessionId();
+      els.transcript.innerHTML = "";
+      loadSessions();
+      closeSidebar();
+    }
+
+    // Collapse the live per-turn status line into a compact, muted final summary
+    // (or remove it if the turn produced nothing to report).
+    function finalizeStatus(statusEl, stats) {
+      const bits = [];
+      if (stats.ttft_s != null) bits.push(`first token ${stats.ttft_s}s`);
+      if (stats.eval_count != null) bits.push(`${stats.eval_count} tok`);
+      if (stats.tok_s != null) bits.push(`${stats.tok_s} tok/s`);
+      if (stats.thinking_tokens) bits.push(`${stats.thinking_tokens} thinking`);
+      statusEl.classList.remove("stall");
+      if (!bits.length) { statusEl.remove(); return; }
+      statusEl.classList.add("done");
+      statusEl.textContent = bits.join(" · ");
+    }
+
+    // A failed turn: keep any partial reply, show the reason under it.
+    function showError(replyEl, statusEl, text) {
+      statusEl.remove();
+      const note = document.createElement("div");
+      note.className = "error-note";
+      note.textContent = `⚠ ${text}`;
+      replyEl.appendChild(note);
+    }
+
+    async function send(message) {
+      if (streaming || !message.trim()) return;
+      streaming = true;
+      abortController = new AbortController();
+      els.send.textContent = "Stop";   // doubles as a cancel button while streaming
+      setBusy(true);              // turn is in process -> run the animation
+      // If the model is already resident (eager-loaded), this turn is generating,
+      // not loading — only show "loading" when it genuinely isn't loaded yet, so a
+      // slow first token on a resident model never reads as a reload.
+      const spec = modelsByName[els.modelSelect.value];
+      activeModelTag = spec ? spec.model : els.modelSelect.value;
+      chatState = residentModels.some((m) => m.name === activeModelTag) ? "generating" : "loading";
+      renderModelStatus();
+      addBubble("user", message);
+
+      // Assistant bubble = a content span + a live status line. The status line is
+      // the in-band liveness signal: waiting (prefill) -> thinking (N tok) ->
+      // generating (~N tok · X tok/s) -> final stats. It replaces having to read
+      // liveness off the hardware monitor.
+      const replyEl = document.createElement("div");
+      replyEl.className = "bubble assistant";
+      const contentEl = document.createElement("span");
+      contentEl.className = "msg-content";
+      const statusEl = document.createElement("div");
+      statusEl.className = "turn-status";
+      statusEl.textContent = "⏳ waiting for first token…";
+      replyEl.append(contentEl, statusEl);
+      els.transcript.appendChild(replyEl);
+      els.transcript.scrollTop = els.transcript.scrollHeight;
+
+      // Live tok/s is measured from the first content token (excludes prefill), and
+      // a watchdog flags a stall if NO event of any kind arrives for STALL_MS.
+      let genChars = 0, genStart = 0, stallTimer = null;
+      const armStall = () => {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+          statusEl.classList.add("stall");
+          statusEl.textContent =
+            `⚠ no tokens for ${STALL_MS / 1000}s — still working or stalled? (Stop to cancel)`;
+        }, STALL_MS);
+      };
+      armStall();
+
+      const body = {
+        session_id: sessionId,
+        message,
+        model: els.modelSelect.value,
+        options: readCfgOptions(),
+      };
+
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: abortController.signal,
+        });
+        if (!res.ok) {
+          let detail = `HTTP ${res.status}`;
+          try {
+            const j = await res.json();
+            detail += ": " + (typeof j.detail === "string" ? j.detail
+              : (j.detail || []).map((d) => `${(d.loc || []).slice(1).join(".")} ${d.msg}`).join("; "));
+          } catch (_) { /* non-JSON body */ }
+          throw new Error(detail);
         }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+
+          const events = buf.split("\n\n");
+          buf = events.pop();  // keep the trailing partial event
+          for (const evt of events) {
+            if (evt.startsWith(":")) { armStall(); continue; }   // server keepalive
+            const line = evt.replace(/^data: ?/, "").trim();
+            if (!line) continue;
+            if (line === "[DONE]") { buf = ""; break; }
+            let payload;
+            try { payload = JSON.parse(line); } catch (_) { continue; }
+
+            armStall();   // any event proves the turn is alive; reset the watchdog
+
+            if (payload.delta) {
+              if (chatState === "loading") { chatState = "generating"; renderModelStatus(); }
+              if (!genStart) genStart = performance.now();
+              genChars += payload.delta.length;
+              contentEl.textContent += payload.delta;
+              const secs = (performance.now() - genStart) / 1000;
+              const toks = Math.max(1, Math.round(genChars / 4));   // ~4 chars/token
+              const rate = secs > 0.2 ? ` · ${(toks / secs).toFixed(1)} tok/s` : "";
+              statusEl.classList.remove("stall");
+              statusEl.textContent = `▍ generating · ~${toks} tok${rate}`;
+            } else if (payload.thinking != null) {
+              if (chatState === "loading") { chatState = "generating"; renderModelStatus(); }
+              statusEl.classList.remove("stall");
+              statusEl.textContent = `💭 thinking… (${payload.thinking} tokens)`;
+            } else if (payload.status === "prefill") {
+              statusEl.textContent = "⏳ waiting for first token…";
+            } else if (payload.status) {               // loading / summarizing
+              if (payload.status === "loading") { chatState = "loading"; renderModelStatus(); }
+              statusEl.classList.remove("stall");
+              statusEl.textContent = `⟳ ${payload.text || payload.status}`;
+            } else if (payload.stats) {
+              finalizeStatus(statusEl, payload.stats);
+            } else if (payload.error) {
+              showError(replyEl, statusEl, payload.error);
+            }
+            els.transcript.scrollTop = els.transcript.scrollHeight;
+          }
+        }
+      } catch (err) {
+        if (err.name === "AbortError") {
+          statusEl.classList.remove("stall");
+          statusEl.classList.add("done");
+          statusEl.textContent = "⏹ stopped";
+        } else {
+          showError(replyEl, statusEl, err.message || String(err));
+        }
+      } finally {
+        clearTimeout(stallTimer);
+        streaming = false;
+        abortController = null;
+        els.send.textContent = "Send";
+        setBusy(false);            // turn complete -> stop + clear the animation
+        chatState = "idle";
+        renderModelStatus();       // fall back to the resident-model display
+        loadSessions();
       }
-    } catch (err) {
-      aiBubble.classList.remove('status');
-      if (err.name === 'AbortError') {
-        if (stopRequested) aiBubble.classList.add('stopped');
-        else showError(aiBubble, 'No response from the server for 60 seconds — giving up. The server may be stuck; try again.');
-      } else {
-        showError(aiBubble, 'Connection error: ' + err.message);
-      }
-    } finally {
-      clearTimeout(watchdog);
-      activeController = null;
-      aiBubble.classList.remove('streaming', 'status');
-      if (!textNode.data && !aiBubble.querySelector('.error-note') && !stopRequested) {
-        showError(aiBubble, 'Empty response.');
-      }
-      setStreaming(false);
-      loadSessions(); // refresh list (new session appears)
     }
-  }
 
-  document.getElementById('msg-input').addEventListener('focus', collapseSidebar);
-
-  document.getElementById('msg-input').addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    els.composer.addEventListener("submit", (e) => {
       e.preventDefault();
-      sendMessage();
-    }
-  });
+      if (streaming) {            // the Send button is a Stop button mid-turn
+        if (abortController) abortController.abort();
+        return;
+      }
+      const msg = els.input.value;
+      els.input.value = "";
+      if (isNarrow()) closeSidebar();
+      send(msg);
+    });
+    els.input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        if (!streaming) els.composer.requestSubmit();   // Enter never aborts a turn
+      }
+    });
+    els.modelSelect.addEventListener("change", onModelChange);
+    // Force-CPU toggle changes model placement (GPU<->CPU), so reload accordingly.
+    els.cfgForceCpu.addEventListener("change", () => autoLoadModel(els.modelSelect.value));
+    // Turning Auto-load ON (inactive -> active) loads the currently selected model
+    // now; turning it OFF just stops future auto-loads. (Selecting a model while
+    // Auto-load is on is handled by onModelChange -> autoLoadModel.)
+    els.cfgAutoLoad.addEventListener("change", () => {
+      if (els.cfgAutoLoad.checked) autoLoadModel(els.modelSelect.value);
+    });
+    const PURGE_LABEL = els.purgeGpu.textContent;   // restore target after self-reset
+    els.purgeGpu.addEventListener("click", () => purgeGpu(PURGE_LABEL));
+    els.cfgReset.addEventListener("click", applyCfgDefaults);
+    els.newChat.addEventListener("click", newChat);
 
-  init();
-</script>
+    // ---- Real-time hardware monitor -------------------------------------------
+    const MONITOR_INTERVAL_MS = 1500;
+
+    function gb(mb) {
+      return mb == null ? "?" : (mb / 1024).toFixed(1) + "G";
+    }
+    function bar(pct) {
+      const p = Math.max(0, Math.min(100, pct == null ? 0 : pct));
+      return `<div class="mon-bar"><div class="mon-bar-fill" style="width:${p}%"></div></div>`;
+    }
+    function row(label, value, pct) {
+      return `<div class="mon-row"><span class="mon-k">${label} - </span>` +
+             `<span class="mon-v">${value}</span>${pct == null ? "" : bar(pct)}</div>`;
+    }
+
+    function renderMonitor(s) {
+      if (!s || !s.available) {
+        els.monitorBody.className = "muted-note";
+        els.monitorBody.textContent = (s && s.reason) ? s.reason : "monitor unavailable";
+        return;
+      }
+      els.monitorBody.className = "";
+      const parts = [];
+      // Device-level GPU memory is the truth; Ollama's per-model size_vram is only
+      // its claimed placement. Keep the device row handy to cross-check the model.
+      const dev0 = (s.gpu && s.gpu.available && s.gpu.devices.length) ? s.gpu.devices[0] : null;
+
+      // GPU device(s)
+      if (s.gpu && s.gpu.available && s.gpu.devices.length) {
+        for (const d of s.gpu.devices) {
+          parts.push(`<div class="mon-dev">${esc(d.name)}</div>`);
+          parts.push(row("GPU", (d.util_pct ?? "?") + "%", d.util_pct));
+          parts.push(row("GPU VRAM", `${gb(d.mem_used_mb)} / ${gb(d.mem_total_mb)}`,
+                         d.mem_total_mb ? 100 * d.mem_used_mb / d.mem_total_mb : null));
+          if (d.power_w != null) {
+            const lim = d.power_limit_w != null ? ` / ${d.power_limit_w}W` : "";
+            parts.push(row("Power", `${d.power_w}W${lim}`,
+                           d.power_limit_w ? 100 * d.power_w / d.power_limit_w : null));
+          }
+          if (d.temp_c != null) parts.push(row("Temp", `${d.temp_c}°C`, null));
+        }
+      } else {
+        parts.push(`<div class="mon-dev muted-note">${esc((s.gpu && s.gpu.reason) || "no GPU")}</div>`);
+      }
+
+      // CPU + system memory. CPU package power (RAPL) and temperature are
+      // Linux-only via psutil; on Windows they read n/a — shown explicitly so it's
+      // clear the monitor tried, rather than silently hiding the rows.
+      if (s.cpu) {
+        parts.push(row("CPU", (s.cpu.pct ?? "?") + "%", s.cpu.pct));
+        parts.push(row("Sys RAM", `${gb(s.cpu.mem_used_mb)} / ${gb(s.cpu.mem_total_mb)}`, s.cpu.mem_pct));
+        parts.push(row("CPU W", s.cpu.power_w != null ? `${s.cpu.power_w}W` : "n/a", null));
+        parts.push(row("CPU °C", s.cpu.temp_c != null ? `${s.cpu.temp_c}°C` : "n/a", null));
+      }
+
+      // Resident Ollama model(s): break each model's footprint into the VRAM
+      // portion (size_vram) vs the RAM/CPU portion (total size - size_vram), so a
+      // model that has spilled to CPU is obvious. Compare against the device
+      // "GPU VRAM" row above — if that stays near 0 while a model claims VRAM here,
+      // the offload didn't actually land on the card (model is running on CPU).
+      if (s.ollama && s.ollama.reachable && s.ollama.running.length) {
+        for (const m of s.ollama.running) {
+          parts.push(`<div class="mon-dev">${esc(m.name)} ` +
+                     `<span class="muted-note">${esc(m.param_size)} ${esc(m.quant)}</span></div>`);
+          const vram = m.vram_mb ?? 0, total = m.size_mb ?? 0;
+          const ramPart = Math.max(0, total - vram);
+          parts.push(row("VRAM (reported)", `${gb(vram)} (${m.pct_gpu ?? "?"}%)`, m.pct_gpu));
+          parts.push(row("RAM", gb(ramPart), total ? 100 * ramPart / total : null));
+          // Single-model invariant: the device GPU VRAM is essentially this model's
+          // real GPU footprint. If Ollama claims VRAM the device doesn't show, the
+          // offload didn't land — the model is actually executing on the CPU.
+          if (dev0 && dev0.mem_used_mb != null && vram > 1024 && dev0.mem_used_mb < vram * 0.5) {
+            parts.push(`<div class="mon-warn">⚠ device GPU VRAM ${gb(dev0.mem_used_mb)} ` +
+                       `≪ reported ${gb(vram)} — running on CPU, not the GPU</div>`);
+          }
+        }
+        if (s.ollama.proc_rss_mb != null) {
+          parts.push(row("proc RAM", gb(s.ollama.proc_rss_mb), null));
+        }
+      } else if (s.ollama && !s.ollama.reachable) {
+        parts.push(`<div class="mon-dev muted-note">ollama: not reachable</div>`);
+      }
+
+      els.monitorBody.innerHTML = parts.join("");
+    }
+
+    // Model-load status line: loading (cold start in progress) -> generating ->
+    // idle (showing whatever model the Ollama daemon currently holds resident).
+    function renderModelStatus() {
+      const el = els.modelStatus;
+      if (chatState === "generating") {
+        el.className = "model-status loaded";
+        el.textContent = `${activeModelTag} · generating`;
+      } else if (chatState === "loading") {
+        el.className = "model-status loading";
+        el.textContent = `⟳ loading ${activeModelTag}…`;
+      } else if (modelLoading && !residentModels.some((m) => m.name === loadTag)) {
+        // Only "loading" until the target actually shows up resident in the poll —
+        // a redundant /load against an already-loaded model shouldn't read as loading.
+        el.className = "model-status loading";
+        el.textContent = `⟳ loading ${loadTag}…`;
+      } else if (residentModels.length) {
+        el.className = "model-status loaded";
+        el.textContent = "loaded: " + residentModels.map((m) => m.name).join(", ");
+      } else {
+        el.className = "model-status idle";
+        el.textContent = "no model loaded";
+      }
+    }
+
+    async function pollMonitor() {
+      try {
+        const res = await fetch("/monitor", { cache: "no-store" });
+        const snap = await res.json();
+        residentModels = (snap.ollama && snap.ollama.reachable) ? snap.ollama.running : [];
+        renderMonitor(snap);
+        renderModelStatus();
+        els.monitorDot.classList.add("live");
+      } catch (e) {
+        els.monitorDot.classList.remove("live");
+      }
+    }
+
+    pollMonitor();
+    setInterval(pollMonitor, MONITOR_INTERVAL_MS);
+
+    // On initial connection: populate models, list sessions, then eagerly load the
+    // default model (purging anything else resident) so it's ready to chat.
+    loadModels().then(() => {
+      loadSessions();
+      autoLoadModel(els.modelSelect.value);
+    });
+  </script>
 </body>
 </html>

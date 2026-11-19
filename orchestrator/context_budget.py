@@ -1,108 +1,173 @@
+"""Context-budget allocator — pack the model's window within a token budget.
+
+This is the core engineering surface. Each progressive level is a packing
+strategy behind the same ``assemble()`` interface, so summarizer / retrieval /
+pinned-facts providers slot in without touching the API or UI.
+
+    budget = num_ctx - max_tokens - safety_margin
+
+Anchors (system prompt + current message) are reserved first, then an optional
+running summary (Level 2), then recent turns by recency. A hard guard refuses
+any assembly that would exceed ``budget`` — at every level.
+
+  * Level 0 — raw passthrough: full history; refuses (doesn't trim) on overflow.
+  * Level 1 — sliding window: system + current + as many recent turns as fit.
+  * Level 2 — the orchestrator compresses older turns with recursive
+    summarization, then packs (summary, recent turns) here with the Level 1
+    packer — so the summarizer's "recency wins" overflow can never push the
+    prompt past the window.
+
+Token counting is a chars-per-token heuristic, calibrated per model against
+the backend's reported ``prompt_eval_count``.
+"""
+
+from __future__ import annotations
+
 import math
+from dataclasses import dataclass
 
-# Chat templates wrap every message in role markers / separators. A few tokens
-# per message is typical across Ollama's templates; counting it keeps a long
-# history of short turns from sneaking past the guard.
-MESSAGE_OVERHEAD_TOKENS = 4
+_PER_MESSAGE_OVERHEAD_TOKENS = 4  # role markers / separators added by chat templates
 
 
-def estimate_tokens(text: str) -> int:
-    """Rough heuristic: ~4 chars per token. Calibrated per model via TokenCalibrator."""
-    return max(1, len(text) // 4)
+class ContextOverflowError(ValueError):
+    """Raised when even the anchors (or a Level-0 history) cannot fit the budget."""
 
 
-def estimate_messages(messages: list[dict]) -> int:
-    """Uncalibrated estimate for a whole assembled prompt (what calibration compares
-    against Ollama's prompt_eval_count)."""
-    return sum(estimate_tokens(m["content"]) + MESSAGE_OVERHEAD_TOKENS for m in messages)
+@dataclass
+class Assembly:
+    messages: list[dict]
+    prompt_tokens_est: int
+    budget: int
+    dropped_turns: int = 0
+    summary_dropped: bool = False
 
 
-class TokenCalibrator:
-    """Per-model correction factor for the chars/4 heuristic (build spec §7).
+class ContextBudget:
+    def __init__(
+        self,
+        *,
+        safety_margin: int = 768,
+        level: int = 0,
+        chars_per_token: float = 4.0,
+    ) -> None:
+        self.safety_margin = safety_margin
+        self.level = level
+        self.base_chars_per_token = chars_per_token
+        self._cpt: dict[str, float] = {}
 
-    After each turn the orchestrator feeds in (estimated, actual prompt_eval_count);
-    the ratio is an EMA of actual/estimated. It is floored at 1.0 on purpose: the
-    calibration may only make the hard window guard *stricter* than the heuristic,
-    never looser, so a noisy or low reading can't cause an overflow.
-    """
+    # --- token counting -----------------------------------------------------
 
-    def __init__(self, alpha: float = 0.3, floor: float = 1.0, cap: float = 4.0):
-        self.alpha = alpha
-        self.floor = floor
-        self.cap = cap
-        self._ratios: dict[str, float] = {}
+    def chars_per_token(self, model: str | None = None) -> float:
+        return self._cpt.get(model, self.base_chars_per_token) if model else self.base_chars_per_token
 
-    def ratio(self, model: str) -> float:
-        return self._ratios.get(model, self.floor)
+    def estimate_tokens(self, text: str, model: str | None = None) -> int:
+        return self.estimate_tokens_from_chars(len(text), model)
 
-    def observe(self, model: str, estimated: int, actual: int | None) -> float:
-        if estimated > 0 and actual:
-            sample = actual / estimated
-            prev = self._ratios.get(model)
-            new = sample if prev is None else prev + self.alpha * (sample - prev)
-            self._ratios[model] = min(self.cap, max(self.floor, new))
-        return self.ratio(model)
+    def estimate_tokens_from_chars(self, n_chars: int, model: str | None = None) -> int:
+        """Token estimate from a character count alone — also used for the
+        streaming thinking heartbeat, which only tracks a running length."""
+        return max(1, math.ceil(n_chars / self.chars_per_token(model)))
 
+    def message_tokens(self, message: dict, model: str | None = None) -> int:
+        return self.estimate_tokens(message.get("content", ""), model) + _PER_MESSAGE_OVERHEAD_TOKENS
 
-class ContextBudgetAllocator:
-    """Packs model context within a token budget. The hard guard applies at every level."""
+    def total_tokens(self, messages: list[dict], model: str | None = None) -> int:
+        return sum(self.message_tokens(m, model) for m in messages)
 
-    def __init__(self, model_ctx: int, max_tokens: int, safety_margin: int, ratio: float = 1.0):
-        self.budget = model_ctx - max_tokens - safety_margin
-        self.ratio = ratio
-        if self.budget <= 0:
-            raise ValueError(
-                f"Budget is non-positive: ctx={model_ctx}, "
-                f"max_tokens={max_tokens}, margin={safety_margin}"
-            )
+    def calibrate(self, model: str, prompt_chars: int, prompt_eval_count: int | None) -> float:
+        """Nudge this model's chars-per-token toward the backend's real count (EMA).
 
-    def cost(self, text: str) -> int:
-        return math.ceil(estimate_tokens(text) * self.ratio) + MESSAGE_OVERHEAD_TOKENS
+        Capped at the base heuristic on purpose: calibration may only make the
+        hard guard *stricter* (fewer chars per token = more tokens estimated),
+        never looser, so a noisy or low reading can't cause an overflow. Ollama
+        reports the full prompt even on a prompt-cache hit, so the signal is sound.
+        """
+        cur = self.chars_per_token(model)
+        if prompt_eval_count and prompt_eval_count > 0 and prompt_chars > 0:
+            observed = prompt_chars / prompt_eval_count
+            cur = 0.7 * cur + 0.3 * observed
+            cur = min(self.base_chars_per_token, max(1.5, cur))
+            self._cpt[model] = cur
+        return cur
+
+    # --- assembly -----------------------------------------------------------
 
     def assemble(
         self,
+        *,
         system_prompt: str,
-        turns: list[dict],
+        history: list[dict],
         current_message: str,
-        summary: str = "",
-    ) -> list[dict]:
+        num_ctx: int,
+        max_tokens: int,
+        model: str | None = None,
+        summary: str | None = None,
+        sliding: bool | None = None,
+    ) -> Assembly:
+        """Build the messages list for one turn, honoring the budget.
+
+        ``history`` is prior turns ({"role","content"}), oldest first, excluding the
+        current message. ``summary`` (Level 2) is injected as a system message right
+        after the system prompt. ``sliding`` forces the Level 1 packer (default:
+        from ``level``). Raises :class:`ContextOverflowError` if it cannot fit.
         """
-        Build the messages list for the model, respecting the token budget.
-        Priority (highest first): system prompt, summary, recent turns, current message.
-        Oldest turns are dropped first if budget is tight.
-        """
-        anchor_tokens = self.cost(system_prompt) + self.cost(current_message)
-        if anchor_tokens > self.budget:
-            raise ValueError(
-                f"Message too long for this model's context window "
-                f"(~{anchor_tokens} tokens needed, {self.budget} available). "
-                "Shorten the message or pick a model with a larger window."
+        budget = num_ctx - max_tokens - self.safety_margin
+        if budget <= 0:
+            raise ContextOverflowError(
+                f"Non-positive budget: num_ctx={num_ctx} - max_tokens={max_tokens} - "
+                f"safety_margin={self.safety_margin}. Raise the context size or lower Max tokens."
             )
 
-        remaining = self.budget - anchor_tokens
+        system_msg = {"role": "system", "content": system_prompt}
+        current_msg = {"role": "user", "content": current_message}
+        anchors_tokens = self.message_tokens(system_msg, model) + self.message_tokens(current_msg, model)
+        if anchors_tokens > budget:
+            raise ContextOverflowError(
+                f"Message too long for this context window (~{anchors_tokens} tokens needed, "
+                f"{budget} available). Shorten it, raise the context size, or pick a model "
+                "with a larger window."
+            )
+        remaining = budget - anchors_tokens
 
-        summary_block = f"[Earlier conversation summary]\n{summary}" if summary else ""
-        if summary_block:
-            summary_tokens = self.cost(summary_block)
-            if summary_tokens > remaining:
-                summary_block = ""
+        head = [system_msg]
+        summary_dropped = False
+        if summary:
+            summary_msg = {"role": "system", "content": summary}
+            cost = self.message_tokens(summary_msg, model)
+            if cost <= remaining:
+                head.append(summary_msg)
+                remaining -= cost
             else:
-                remaining -= summary_tokens
+                summary_dropped = True
 
-        # Fill with turns, most-recent first, then reverse for chronological order.
-        # Stop at the first turn that doesn't fit so the kept history is contiguous.
-        included: list[dict] = []
-        for turn in reversed(turns):
-            cost = self.cost(turn["content"])
-            if cost > remaining:
-                break
-            included.append(turn)
-            remaining -= cost
-        included.reverse()
+        if sliding is None:
+            sliding = self.level >= 1
 
-        messages: list[dict] = [{"role": "system", "content": system_prompt}]
-        if summary_block:
-            messages.append({"role": "system", "content": summary_block})
-        messages.extend(included)
-        messages.append({"role": "user", "content": current_message})
-        return messages
+        if not sliding:
+            history_tokens = self.total_tokens(history, model)
+            if history_tokens > remaining:
+                # Hard guard: Level 0 neither summarizes nor drops, so it refuses.
+                raise ContextOverflowError(
+                    f"This conversation (~{anchors_tokens + history_tokens} tokens) no longer "
+                    f"fits the {num_ctx}-token context window. Start a new chat, raise the "
+                    "context size, or set CONTEXT_LEVEL=2 to summarize older turns."
+                )
+            kept = list(history)
+        else:
+            kept = []
+            for msg in reversed(history):  # most recent first; stop at the first misfit
+                cost = self.message_tokens(msg, model)
+                if cost > remaining:
+                    break
+                kept.append(msg)
+                remaining -= cost
+            kept.reverse()
+
+        messages = [*head, *kept, current_msg]
+        return Assembly(
+            messages=messages,
+            prompt_tokens_est=self.total_tokens(messages, model),
+            budget=budget,
+            dropped_turns=len(history) - len(kept),
+            summary_dropped=summary_dropped,
+        )
