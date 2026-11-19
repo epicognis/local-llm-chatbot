@@ -11,7 +11,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     # How long Ollama keeps a model resident after a turn when the UI's
     # "Keep model loaded" toggle is off. Per-request keep_alive overrides it.
     ollama_keep_alive: str = "30m"
+
+    @field_validator("ollama_base_url")
+    @classmethod
+    def _prefer_ipv4_loopback(cls, url: str) -> str:
+        # On Windows "localhost" resolves to IPv6 ::1 first; Ollama listens on
+        # IPv4 only, so every request waited ~2 s for the IPv6 attempt to fail
+        # before falling back (measured: 2.03 s vs 0.02 s per call).
+        return url.replace("://localhost", "://127.0.0.1")
 
     # Generation defaults (the "external" sampling/decoding knobs the UI exposes).
     # top_p / top_k defaults mirror Ollama's own defaults.

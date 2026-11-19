@@ -28,16 +28,28 @@ class Sample:
 class Sampler:
     """Stateful sampler — owns the psutil/RAPL deltas. Call sample() per tick."""
 
+    # Finding the Ollama PIDs walks every process's command line — ~3 s on a busy
+    # Windows desktop — so it's refreshed on this interval rather than per tick.
+    PID_REFRESH_S = 10.0
+
     def __init__(self, ollama_url: str, server_log_path: str | None = None) -> None:
-        self.ollama_url = ollama_url
+        # On Windows "localhost" resolves to IPv6 first and Ollama listens on
+        # IPv4 only: each request would wait ~2 s for the IPv6 attempt to fail.
+        self.ollama_url = ollama_url.replace("://localhost", "://127.0.0.1")
         self._sys = SystemCollector()
         self._turns = TurnTailer(server_log_path) if server_log_path else None
+        self._pids: set[int] = set()
+        self._pids_at = float("-inf")
 
     def sample(self) -> Sample:
         gpu = sample_gpu()
         ol = ollama_client.ps(self.ollama_url)
 
-        pids = find_ollama_pids()
+        now = time.monotonic()
+        if now - self._pids_at >= self.PID_REFRESH_S:
+            self._pids = find_ollama_pids()
+            self._pids_at = now
+        pids = self._pids
         sysnap = self._sys.sample(pids)
 
         ollama_procs = [p for p in sysnap.procs if p.pid in pids]

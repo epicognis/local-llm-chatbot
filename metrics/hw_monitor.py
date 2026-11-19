@@ -39,9 +39,19 @@ def _f(x: float | None, ndigits: int = 1) -> float | None:
 class HardwareMonitor:
     """Per-process wrapper over ``llmmon.Sampler`` producing JSON snapshots."""
 
+    # A sample takes ~0.1-0.5 s; browser tabs each poll every 1.5 s. Callers
+    # within this window share the last result, and callers arriving while a
+    # sample is in flight await that same sample — so polls never queue up
+    # behind each other (the panel would otherwise lag further behind with
+    # every open tab).
+    MAX_AGE_S = 1.0
+
     def __init__(self, ollama_url: str) -> None:
         self._lock = asyncio.Lock()
         self._sampler = Sampler(ollama_url) if Sampler is not None else None
+        self._last: dict | None = None
+        self._last_at = 0.0
+        self._inflight: asyncio.Future | None = None
 
     @property
     def available(self) -> bool:
@@ -50,13 +60,26 @@ class HardwareMonitor:
     async def snapshot(self) -> dict:
         if self._sampler is None:
             return {"available": False, "reason": _IMPORT_ERROR or "monitor unavailable"}
-        # Serialize access: the sampler keeps per-tick deltas and isn't reentrant.
-        async with self._lock:
-            try:
-                sample = await asyncio.to_thread(self._sampler.sample)
-            except Exception as exc:  # noqa: BLE001
-                return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
-        return self._to_dict(sample)
+        loop = asyncio.get_running_loop()
+        if self._last is not None and loop.time() - self._last_at < self.MAX_AGE_S:
+            return self._last
+        if self._inflight is not None:
+            return await asyncio.shield(self._inflight)
+        self._inflight = loop.create_future()
+        try:
+            # The sampler keeps per-tick deltas and isn't reentrant: one at a time.
+            async with self._lock:
+                try:
+                    result = self._to_dict(await asyncio.to_thread(self._sampler.sample))
+                except Exception as exc:  # noqa: BLE001
+                    result = {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+            self._last, self._last_at = result, loop.time()
+            self._inflight.set_result(result)
+            return result
+        finally:
+            if not self._inflight.done():
+                self._inflight.cancel()
+            self._inflight = None
 
     @staticmethod
     def _to_dict(s) -> dict:

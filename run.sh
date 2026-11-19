@@ -279,5 +279,9 @@ announce &
 # Unbuffered: piped through tee, Python would otherwise block-buffer stdout and
 # the monitor would see turn_complete lines only after ~8KB of log accumulates.
 export PYTHONUNBUFFERED=1
+# --timeout-graceful-shutdown: on a code-change reload (or Ctrl+C), uvicorn
+# otherwise waits forever for open connections — browser tabs polling /monitor,
+# keep-alives — and the reload never completes, leaving the server unresponsive.
 "$PYTHON_BIN" -m uvicorn api.main:create_app --factory --host 0.0.0.0 --port "$PORT" \
+    --timeout-graceful-shutdown 3 \
     "${RELOAD_ARGS[@]}" 2>&1 | tee server.log
